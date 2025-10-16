@@ -8,13 +8,13 @@ from detectron2 import model_zoo
 import cv2
 import os
 
-
-
 corruption_types = get_corruption_names()
 severity = 5
-root_dir =  "./datasets"
+root_dir =  "/home/lyz6/AMROD/datasets/"
 raw_cityscapes_dir = os.path.join(root_dir, "cityscapes/leftImg8bit/val")
-b = ["gaussian_noise", "shot_noise", "impulse_noise"]
+b = ['gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur', 'glass_blur', 'motion_blur', 'zoom_blur', 'snow', 'brightness', 'contrast', 'elastic_transform', 'pixelate', 'jpeg_compression']
+print(corruption_types)
+
 for corruption in corruption_types:
     corrupt_root_dir = os.path.join(root_dir, corruption)
     if corruption in b:
@@ -35,4 +35,3 @@ for corruption in corruption_types:
                 image = cv2.imread(os.path.join(root, filename))
                 corrupted = corrupt(image, corruption_name=corruption, severity=severity)
                 cv2.imwrite(os.path.join(corrupt_cityscapes_city_dir, filename), corrupted)
-        

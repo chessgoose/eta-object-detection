@@ -228,8 +228,8 @@ def convert_cityscapes_instance_only(data_dir, out_dir):
 def parse_args():
     parser = argparse.ArgumentParser(description='Convert dataset')
     parser.add_argument('--dataset', help="cityscapes", default='cityscapes', type=str)
-    parser.add_argument('--outdir', help="output dir for json files", default='data/cityscapes/annotations', type=str)
-    parser.add_argument('--datadir', help="data dir for annotations to be converted", default="data/cityscapes", type=str)
+    parser.add_argument('--outdir', help="output dir for json files", default='/home/lyz6/', type=str)
+    parser.add_argument('--datadir', help="data dir for annotations to be converted", default="/home/cityscapes", type=str)
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(1)

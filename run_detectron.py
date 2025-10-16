@@ -150,7 +150,9 @@ def main():
     print("=" * 60)
     
     # Configuration
-    image_path = "/home/lyz6/cityscapes/test/berlin/berlin_000000_000019_leftImg8bit.png"  # Change this to your image path
+    # image_path = "/home/lyz6/AMROD/datasets/cityscapes/test/berlin/berlin_000000_000019_leftImg8bit.png"  # Change this to your image path
+    image_path = "/home/lyz6/palmer_scratch/eta-object-detection/PhotoFunia-1759344129.jpg"
+
     output_path = "detection_results.jpg"
     model_name = "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"
     confidence_threshold = 0.5
