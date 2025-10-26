@@ -1,5 +1,5 @@
 """
-Energy-Based Test-Time Adaptation for Object Detection (ETA-style)
+New Energy Model (ETA-style)
 """
 
 import torch
@@ -220,21 +220,60 @@ def compute_target_energy(errors, temperature=0.5):
     return (1.0 - torch.exp(-errors / temperature)).clamp(0, 1)
 
 # ===== Extract RoI features =====
+
 def extract_roi_features(model, image_tensor, boxes):
     """
-    Extract 7x7 ROI features from Detectron2 backbone.
+    Extract 7x7 ROI features from Detectron2 backbone using multi-level FPN.
+    
+    CRITICAL FIX: Now uses the SAME multi-level pooling as the detector!
+    
+    WHY THIS MATTERS:
+    - Detectron2's FPN assigns boxes to different pyramid levels by size:
+        * Small boxes (area < 96²) → p2 (stride 4, high resolution)
+        * Medium boxes → p3 (stride 8)
+        * Large boxes (area > 384²) → p4/p5 (stride 16/32, low resolution)
+    
+    - The OLD code only used p2, so:
+        ❌ Large boxes got wrong features (should be p4/p5, got p2)
+        ❌ Energy model saw DIFFERENT info than what produced predictions
+    
+    - This FIXED code uses multi-level pooling:
+        ✅ Each box gets features from appropriate pyramid level
+        ✅ Energy model sees SAME features as detector
+        ✅ Better alignment between predictions and energy scores
+    
+    Args:
+        model: Detectron2 model with FPN backbone
+        image_tensor: Preprocessed image tensor [1, 3, H, W]
+        boxes: Tensor of boxes [N, 4] in format [x1, y1, x2, y2]
+    
+    Returns:
+        roi_feats: [N, 256, 7, 7] ROI-aligned features from appropriate pyramid levels
     """
+    from detectron2.modeling.poolers import ROIPooler
+    from detectron2.structures import Boxes
+    
+    # Extract FPN features
     features = model.backbone(image_tensor)
+    
+    # CRITICAL: Use multi-level pooling matching the detector
     pooler = ROIPooler(
         output_size=7,
-        scales=(1.0 / model.backbone.output_shape()["p2"].stride,),
+        # Include ALL pyramid levels that the detector uses
+        scales=tuple(1.0 / model.backbone.output_shape()[k].stride 
+                    for k in ["p2", "p3", "p4", "p5"]),
         sampling_ratio=0,
         pooler_type="ROIAlignV2"
     )
+    
+    # Pool from ALL levels - ROIPooler automatically selects correct level per box
     roi_boxes = [Boxes(boxes)]
-    roi_feats = pooler([features["p2"]], roi_boxes)
+    roi_feats = pooler(
+        [features["p2"], features["p3"], features["p4"], features["p5"]],
+        roi_boxes
+    )
+    
     return roi_feats
-
 
 def train_energy_model(
     clean_dir,
@@ -354,8 +393,8 @@ if __name__ == "__main__":
         blur_dir=BLUR_DIR,
         ann_file=ANN_FILE,
         num_epochs=3,
-        learning_rate=5e-4,
+        learning_rate=3e-4,
         temperature=200,
         device="cuda",
-        save_path="roi_energy_model.pth"
+        save_path="multiple_roi_energy_model.pth"
     )

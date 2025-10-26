@@ -85,6 +85,7 @@ def test_energy_model(model_path, clean_dir, blur_dir, ann_file, device="cuda"):
     H, W = sample["height"], sample["width"]
     gt = prepare_gt_instances(sample["annotations"], (H, W), device)
     print(gt)
+    print(H, W)
 
     clean_out = predictor(clean_img)["instances"].to(device)
     if len(clean_out) == 0 or len(gt) == 0:
