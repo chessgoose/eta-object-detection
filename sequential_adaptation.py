@@ -1,6 +1,17 @@
 """
 Detectron2 Sequential Test-Time Adaptation with Energy Model
-FINAL VERSION - With correct feature key handling and motion-blurred images
+"""
+
+"""
+As high-energy test-time predictions
+ˆ dt = fθ,ψ(It, zt) correspond to out-of-distribution
+predictions, we posit that minimizing their energy will improve
+the fidelity of predictions by aligning them back to
+those of the source data distribution. Hence, minimizing the
+energy e predicted from Eϕ is analogous to minimizing the
+likelihood of error learned from the source data. This motivates
+an energy-based adaptation loss that aims to reduce
+the energy of ˆ dt(x) conditioned on zt(x):
 """
 
 import cv2
@@ -13,11 +24,12 @@ import os
 from collections import defaultdict
 from pathlib import Path
 
-from detectron2.modeling import build_model
+from detectron2.modeling import build_model, BACKBONE_REGISTRY, Backbone
 from detectron2.config import get_cfg
 from detectron2 import model_zoo
 from detectron2.structures import Instances
 from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.modeling.backbone import build_backbone
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -62,9 +74,7 @@ class LightweightAdaptationLayer(nn.Module):
         self.adapt = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
             nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels)
+            nn.ReLU(inplace=True)
         )
         
         # Initialize adaptation layer near identity
@@ -82,11 +92,70 @@ class LightweightAdaptationLayer(nn.Module):
 
 
 # ==============================================================
-# DETECTRON2 SETUP WITH ADAPTATION
+# CUSTOM BACKBONE WITH ADAPTATION LAYER
 # ==============================================================
 
-def setup_detectron2_with_adaptation(device="cuda"):
-    """Setup Detectron2 model with adaptation layer inserted."""
+@BACKBONE_REGISTRY.register()
+class AdaptiveBackbone(Backbone):
+    """
+    Wrapper backbone that adds an adaptation layer to a specific feature level.
+    This backbone wraps an existing backbone and applies adaptation to one feature map.
+    """
+    def __init__(self, cfg, input_shape, base_backbone, feature_key='p4'):
+        super().__init__()
+        
+        self.base_backbone = base_backbone
+        self.feature_key = feature_key
+        
+        # Get the shape of the feature we want to adapt
+        base_output_shape = base_backbone.output_shape()
+        
+        if feature_key not in base_output_shape:
+            # If requested feature doesn't exist, use first available
+            available_keys = list(base_output_shape.keys())
+            print(f"⚠️  Feature '{feature_key}' not found. Available: {available_keys}")
+            self.feature_key = available_keys[0]
+            print(f"   Using '{self.feature_key}' instead")
+        
+        feature_channels = base_output_shape[self.feature_key].channels
+        
+        # Create adaptation layer
+        self.adaptation_layer = LightweightAdaptationLayer(feature_channels)
+        print(f"✅ Created adaptation layer for '{self.feature_key}' ({feature_channels} channels)")
+        
+        # Store output shape (same as base backbone)
+        self._output_shape = base_output_shape
+    
+    def forward(self, x):
+        """Forward pass with adaptation applied to specified feature"""
+        # Get features from base backbone
+        features = self.base_backbone(x)
+        
+        # Apply adaptation to the specified feature
+        if self.feature_key in features:
+            features[self.feature_key] = self.adaptation_layer(features[self.feature_key])
+        
+        return features
+    
+    def output_shape(self):
+        """Return output shape (same as base backbone)"""
+        return self._output_shape
+
+
+# ==============================================================
+# DETECTRON2 SETUP WITH ADAPTIVE BACKBONE
+# ==============================================================
+
+def setup_detectron2_with_adaptation(device="cuda", feature_key='p4', 
+                                     checkpoint_path=None):
+    """Setup Detectron2 model with adaptation layer inserted in backbone.
+    
+    Args:
+        device: Device to load model on
+        feature_key: Which feature map to adapt (e.g., 'p4')
+        checkpoint_path: Optional path to load weights from a previous checkpoint.
+                        If None, loads COCO pretrained weights.
+    """
     cfg = get_cfg()
     cfg.merge_from_file(model_zoo.get_config_file(
         "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
@@ -94,64 +163,119 @@ def setup_detectron2_with_adaptation(device="cuda"):
         "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.05
     
-    model = build_model(cfg)
-    checkpointer = DetectionCheckpointer(model)
-    checkpointer.load(cfg.MODEL.WEIGHTS)
+    # First, build the base backbone
+    base_backbone = build_backbone(cfg)
+    base_backbone = base_backbone.to(device)
     
-    # Detect which feature to adapt - check what features are available
-    model.eval()
+    # Test to see what features are available
     with torch.no_grad():
         dummy_input = torch.randn(1, 3, 800, 800).to(device)
-        dummy_features = model.backbone(dummy_input)
+        dummy_features = base_backbone(dummy_input)
     
     print(f"📊 Available backbone features: {list(dummy_features.keys())}")
     
-    # Choose the feature to adapt
-    # For FPN with ResNet, features are typically named 'p2', 'p3', 'p4', 'p5', 'p6'
-    # We'll adapt p4 which is a good middle-level feature
-    feature_key = None
-    adaptation_channels = None
+    # Choose feature to adapt (try p4 first, then others)
+    available_keys = list(dummy_features.keys())
+    if feature_key not in available_keys:
+        for key in ['p4', 'p3', 'p5', 'res4', 'res5']:
+            if key in available_keys:
+                feature_key = key
+                break
+        else:
+            feature_key = available_keys[0]
     
-    # Priority order: prefer p4, then p3, then any available
-    for key in ['p6', 'p4', 'p3', 'p5', 'res4', 'res5']:
-        if key in dummy_features:
-            feature_key = key
-            adaptation_channels = dummy_features[key].shape[1]
-            print(f"✅ Will adapt feature '{feature_key}' with {adaptation_channels} channels")
-            break
+    # Create adaptive backbone wrapper
+    adaptive_backbone = AdaptiveBackbone(
+        cfg=cfg,
+        input_shape=None,
+        base_backbone=base_backbone,
+        feature_key=feature_key
+    ).to(device)
     
-    if feature_key is None:
-        # Just use the first available feature
-        feature_key = list(dummy_features.keys())[0]
-        adaptation_channels = dummy_features[feature_key].shape[1]
-        print(f"⚠️  Using first available feature '{feature_key}' with {adaptation_channels} channels")
+    # Build the full model with our custom backbone
+    # We need to manually construct the model
+    from detectron2.modeling.meta_arch import GeneralizedRCNN
+    from detectron2.modeling.proposal_generator import build_proposal_generator
+    from detectron2.modeling.roi_heads import build_roi_heads
     
-    # Create and insert adaptation layer
-    adaptation_layer = LightweightAdaptationLayer(adaptation_channels).to(device)
-    print(f"✅ Created adaptation layer for '{feature_key}' ({adaptation_channels} channels)")
+    model = GeneralizedRCNN(
+        backbone=adaptive_backbone,
+        proposal_generator=build_proposal_generator(cfg, adaptive_backbone.output_shape()),
+        roi_heads=build_roi_heads(cfg, adaptive_backbone.output_shape()),
+        pixel_mean=cfg.MODEL.PIXEL_MEAN,
+        pixel_std=cfg.MODEL.PIXEL_STD,
+    )
     
-    model.adaptation_layer = adaptation_layer
-    model.adaptation_feature_key = feature_key  # Store which feature to adapt
-    model.adaptation_inserted = True
+    model = model.to(device)
+    
+    # Load pretrained weights using DetectionCheckpointer (same as original code)
+    checkpointer = DetectionCheckpointer(model)
+    
+    # Determine which weights to load
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"   Loading weights from custom checkpoint: {checkpoint_path}")
+        weights_path = checkpoint_path
+    else:
+        print("   Loading COCO pretrained weights...")
+        weights_path = cfg.MODEL.WEIGHTS
+    
+    # Load with checkpointer - it handles remapping automatically
+    # Use strict=False to allow missing keys (adaptation layer)
+    loaded_dict = checkpointer._load_file(weights_path)
+    
+    # Remap backbone keys: backbone.* -> backbone.base_backbone.*
+    if 'model' in loaded_dict:
+        state_dict = loaded_dict['model']
+    else:
+        state_dict = loaded_dict
+    
+    remapped_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('backbone.') and not k.startswith('backbone.base_backbone.'):
+            # Remap backbone keys
+            new_key = 'backbone.base_backbone.' + k[9:]
+            remapped_state_dict[new_key] = v
+        else:
+            remapped_state_dict[k] = v
+    
+    # Load the remapped state dict
+    incompatible = checkpointer._load_model({"model": remapped_state_dict})
+    
+    # Print loading info
+    if incompatible is not None:
+        adaptation_missing = [k for k in incompatible.missing_keys if 'adaptation_layer' in k]
+        other_missing = [k for k in incompatible.missing_keys if 'adaptation_layer' not in k]
+        
+        print(f"   ✅ Loaded weights successfully")
+        print(f"   - Adaptation layer keys (expected missing): {len(adaptation_missing)}")
+        if other_missing:
+            print(f"   ⚠️  Other missing keys: {len(other_missing)}")
+        if incompatible.unexpected_keys:
+            print(f"   ⚠️  Unexpected keys: {len(incompatible.unexpected_keys)}")
     
     # Freeze all parameters except adaptation layer
     for param in model.parameters():
         param.requires_grad = False
     
-    for param in adaptation_layer.parameters():
+    for param in adaptive_backbone.adaptation_layer.parameters():
         param.requires_grad = True
     
+    # Set appropriate modes
     model.eval()
     for module in model.modules():
         if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
             module.eval()
 
     # Only adaptation layer's BN in training mode
-    for module in adaptation_layer.modules():
+    for module in adaptive_backbone.adaptation_layer.modules():
         if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
             module.train()
 
     model.eval()
+    
+    # Store reference to adaptation layer for easy access
+    model.adaptation_layer = adaptive_backbone.adaptation_layer
+    model.adaptation_feature_key = feature_key
     
     return model, cfg
 
@@ -308,6 +432,41 @@ def compute_average_precision(precisions, recalls):
     return ap
 
 
+# ==============================================================
+# mAP COMPUTATION HELPERS
+# ==============================================================
+
+def compute_iou(box1, box2):
+    """Compute IoU between two boxes [x1, y1, x2, y2]"""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+    
+    return intersection / union if union > 0 else 0
+
+
+def compute_average_precision(precisions, recalls):
+    """Compute AP from precision-recall curve"""
+    recalls = np.concatenate(([0.0], recalls, [1.0]))
+    precisions = np.concatenate(([0.0], precisions, [0.0]))
+    
+    # Make precision monotonically decreasing
+    for i in range(len(precisions) - 2, -1, -1):
+        precisions[i] = max(precisions[i], precisions[i + 1])
+    
+    # Find points where recall changes
+    indices = np.where(recalls[1:] != recalls[:-1])[0] + 1
+    ap = np.sum((recalls[indices] - recalls[indices - 1]) * precisions[indices])
+    
+    return ap
+
+
 def compute_map(predictions_list, ground_truths, iou_threshold=0.5, verbose=False):
     """Compute mAP across multiple images."""
     all_predictions = defaultdict(list)
@@ -404,40 +563,21 @@ def compute_map(predictions_list, ground_truths, iou_threshold=0.5, verbose=Fals
 
 
 # ==============================================================
-# FORWARD PASS WITH ADAPTATION LAYER
-# ==============================================================
-
-def forward_with_adaptation(model, image_tensor, height, width, device):
-    """
-    Forward pass through model WITH adaptation layer applied.
-    """
-    inputs = [{"image": image_tensor, "height": height, "width": width}]
-    images = model.preprocess_image(inputs)
-    features = model.backbone(images.tensor)
-    
-    # Apply adaptation layer to the designated feature
-    if hasattr(model, 'adaptation_layer') and hasattr(model, 'adaptation_feature_key'):
-        feature_key = model.adaptation_feature_key
-        if feature_key in features:
-            features[feature_key] = model.adaptation_layer(features[feature_key])
-    
-    return images, features
-
-
-# ==============================================================
 # ADAPTATION STEP
 # ==============================================================
 
 def adaptation_step(model, energy_model, image, device):
     """
     Perform one adaptation step using energy loss.
-    Uses adaptation layer in forward pass.
+    The adaptation layer is now inside the backbone, so we just do forward pass normally.
     """
     height, width = image.shape[:2]
     image_tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).to(device)
     
-    # Forward with adaptation
-    images, features = forward_with_adaptation(model, image_tensor, height, width, device)
+    # Forward pass (adaptation is applied inside backbone)
+    inputs = [{"image": image_tensor, "height": height, "width": width}]
+    images = model.preprocess_image(inputs)
+    features = model.backbone(images.tensor)
     
     # Extract the adapted feature for energy computation
     feature_key = model.adaptation_feature_key
@@ -464,7 +604,7 @@ def sequential_test_time_adaptation(
     score_threshold=0.05,
     verbose=False
 ):
-    """Sequential test-time adaptation with proper adaptation layer usage."""
+    """Sequential test-time adaptation with adaptation layer inside backbone."""
     if not hasattr(model, 'adaptation_layer'):
         raise ValueError("Model must have adaptation_layer attribute")
     
@@ -477,6 +617,9 @@ def sequential_test_time_adaptation(
         'num_detections_before': [],
         'num_detections_after': []
     }
+    
+    # To evaluate "before" adaptation, we need to temporarily disable the adaptation layer
+    # We'll do this by saving/restoring the adaptation layer's parameters
     
     # Process each image sequentially
     for img_idx, data in enumerate(dataset):
@@ -495,7 +638,18 @@ def sequential_test_time_adaptation(
             device
         )
         
-        # Evaluate BEFORE adaptation (without adaptation layer)
+        # Evaluate BEFORE adaptation - temporarily make adaptation layer identity
+        # Save current adaptation weights
+        saved_state = {name: param.clone() for name, param in model.adaptation_layer.named_parameters()}
+        
+        # Zero out the adaptation layer to make it identity
+        with torch.no_grad():
+            for module in model.adaptation_layer.adapt.modules():
+                if isinstance(module, nn.Conv2d):
+                    module.weight.zero_()
+                    if module.bias is not None:
+                        module.bias.zero_()
+        
         model.eval()
         for module in model.modules():
             if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
@@ -505,15 +659,19 @@ def sequential_test_time_adaptation(
             height, width = image.shape[:2]
             image_tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).to(device)
             
-            # Forward WITHOUT adaptation layer for baseline
+            # Forward pass (adaptation layer is now identity)
             inputs = [{"image": image_tensor, "height": height, "width": width}]
             images = model.preprocess_image(inputs)
             features = model.backbone(images.tensor)
-            # Don't apply adaptation layer
             
             proposals, _ = model.proposal_generator(images, features, None)
             predictions_before, _ = model.roi_heads(images, features, proposals, None)
             predictions_before = predictions_before[0]
+        
+        # Restore adaptation layer weights
+        with torch.no_grad():
+            for name, param in model.adaptation_layer.named_parameters():
+                param.copy_(saved_state[name])
         
         # Filter and remap predictions
         pred_before = filter_and_remap_predictions(predictions_before, score_threshold)
@@ -541,7 +699,7 @@ def sequential_test_time_adaptation(
         for iter_idx in range(iterations_per_image):
             optimizer.zero_grad()
             
-            # Adaptation step (uses adaptation layer)
+            # Adaptation step (backbone will apply adaptation layer)
             energy_loss, _ = adaptation_step(model, energy_model, image, device)
             
             if verbose and iter_idx == 0:
@@ -558,15 +716,17 @@ def sequential_test_time_adaptation(
         
         avg_energy_loss = total_energy_loss / iterations_per_image if iterations_per_image > 0 else 0
         
-        # Evaluate AFTER adaptation (with adaptation layer)
+        # Evaluate AFTER adaptation (with trained adaptation layer)
         model.eval()
         for module in model.modules():
             if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 module.eval()
         
         with torch.no_grad():
-            # Forward WITH adaptation layer
-            images, features = forward_with_adaptation(model, image_tensor, height, width, device)
+            # Forward pass (adaptation layer active)
+            inputs = [{"image": image_tensor, "height": height, "width": width}]
+            images = model.preprocess_image(inputs)
+            features = model.backbone(images.tensor)
             
             proposals, _ = model.proposal_generator(images, features, None)
             predictions_after, _ = model.roi_heads(images, features, proposals, None)
@@ -613,6 +773,7 @@ def main():
     """Main function"""
     print("\n" + "=" * 60)
     print("ETA for Object Detection - Motion Blurred Images")
+    print("WITH ADAPTATION LAYER INSIDE RESNET BACKBONE")
     print("=" * 60)
     print()
     
@@ -622,21 +783,31 @@ def main():
         'image_dir': '/home/lyz6/AMROD/datasets/motion_blur/leftImg8bit/val',
         'annotation_file': '/home/lyz6/AMROD/datasets/cityscapes/annotations/instancesonly_filtered_gtFine_val.json',
         'energy_model_path': '/home/lyz6/palmer_scratch/eta-object-detection/multiple_roi_energy_model_epoch2.pth',
+        
+        # Optional: Load from previous checkpoint instead of COCO weights
+        # Set to None to use COCO pretrained weights
+        'checkpoint_path': None,  # e.g., '/path/to/your/previous_model.pth'
+        
         'max_images': 20,
-        'adaptation_lr': 0.1,
+        'adaptation_lr': 1e-2,
         'iterations_per_image': 3,
-        'score_threshold': 0.10,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+        'score_threshold': 0.05,
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'feature_key': 'p4'  # Which feature to adapt
     }
     
     device = torch.device(config['device'])
     print(f"Using device: {device}")
     print(f"Using MOTION BLURRED images from: {config['image_dir']}\n")
     
-    # Setup Detectron2 with adaptation
-    print("[1/4] Setting up Detectron2 with adaptation layer...")
-    model, cfg = setup_detectron2_with_adaptation(device)
-    print("✅ Setup complete with adaptation layer\n")
+    # Setup Detectron2 with adaptive backbone
+    print("[1/4] Setting up Detectron2 with adaptive backbone...")
+    model, cfg = setup_detectron2_with_adaptation(
+        device, 
+        feature_key=config['feature_key'],
+        checkpoint_path=config['checkpoint_path']
+    )
+    print("✅ Setup complete with adaptation layer inside backbone\n")
     
     # Load energy model
     print("[2/4] Loading trained energy model...")
@@ -695,7 +866,7 @@ def main():
     )
     
     # Save results
-    output_file = 'sequential_adaptation_results_motion_blur.json'
+    output_file = 'sequential_adaptation_results_backbone_motion_blur.json'
     with open(output_file, 'w') as f:
         json_results = {k: [float(v) for v in vals] for k, vals in results.items()}
         json.dump(json_results, f, indent=2)

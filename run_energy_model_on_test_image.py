@@ -189,7 +189,7 @@ def visualize_ground_truth(image, gt_instances, save_path="ground_truth.png"):
 
 # Example usage
 if __name__ == "__main__":
-    MODEL_PATH = "motion_blur_energy_model.pth"
+    MODEL_PATH = "multiple_roi_energy_model_epoch2.pth"
     CLEAN_DIR = "/home/lyz6/AMROD/datasets/cityscapes/leftImg8bit/val"
     BLUR_DIR = "/home/lyz6/AMROD/datasets/motion_blur/leftImg8bit/val"
     ANN_FILE = "/home/lyz6/AMROD/datasets/cityscapes/annotations/instancesonly_filtered_gtFine_val.json"
