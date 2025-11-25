@@ -1,6 +1,7 @@
 # output dir
 detectron2
 output
+runs
 instant_test_output
 inference_test_output
 

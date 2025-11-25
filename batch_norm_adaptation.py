@@ -650,7 +650,7 @@ def main():
         # Optional: Load from previous checkpoint instead of COCO weights
         'checkpoint_path': None,
         
-        'max_images': 50,
+        'max_images': 492,
         'adaptation_lr': 0.01,  # Learning rate for BN affine parameters
         'iterations_per_image': 3,  # Usually 1-3 iterations
         'score_threshold': 0.05,

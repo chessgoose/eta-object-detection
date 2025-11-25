@@ -1,17 +1,15 @@
 """
-Detectron2 Sequential Test-Time Adaptation with Energy Model
-"""
+Test-Time Adaptation with Batch Normalization and ROI-based Energy Guidance
+Combines BN adaptation with ROI-based energy model guidance for object detection
 
-"""
-As high-energy test-time predictions
-ˆ dt = fθ,ψ(It, zt) correspond to out-of-distribution
-predictions, we posit that minimizing their energy will improve
-the fidelity of predictions by aligning them back to
-those of the source data distribution. Hence, minimizing the
-energy e predicted from Eϕ is analogous to minimizing the
-likelihood of error learned from the source data. This motivates
-an energy-based adaptation loss that aims to reduce
-the energy of ˆ dt(x) conditioned on zt(x):
+This script uses an energy model that:
+1. Takes ROI-aligned features from detections
+2. Predicts energy maps per detection
+3. Guides adaptation by minimizing predicted energy
+
+The energy model expects:
+- Input: (N, 256, 7, 7) ROI-aligned features per detection
+- Output: (N, 1, h, w) energy maps per detection
 """
 
 import cv2
@@ -23,13 +21,17 @@ import json
 import os
 from collections import defaultdict
 from pathlib import Path
+from datetime import datetime
 
-from detectron2.modeling import build_model, BACKBONE_REGISTRY, Backbone
+from detectron2.modeling import build_model
 from detectron2.config import get_cfg
 from detectron2 import model_zoo
-from detectron2.structures import Instances
+from detectron2.structures import Instances, Boxes
 from detectron2.checkpoint import DetectionCheckpointer
-from detectron2.modeling.backbone import build_backbone
+from detectron2.layers import FrozenBatchNorm2d
+from detectron2.modeling.poolers import ROIPooler
+
+from torch.utils.tensorboard import SummaryWriter
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -64,95 +66,108 @@ EVAL_CLASSES = [0, 1, 2, 3, 5, 6, 7]
 
 
 # ==============================================================
-# LIGHTWEIGHT ADAPTATION LAYER
+# BN CONVERSION UTILITIES
 # ==============================================================
 
-class LightweightAdaptationLayer(nn.Module):
-    """Lightweight adaptation module for test-time adaptation"""
-    def __init__(self, in_channels: int):
-        super().__init__()
-        self.adapt = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True)
+def convert_frozen_batchnorm_to_batchnorm(module):
+    """
+    Recursively convert all FrozenBatchNorm2d layers to BatchNorm2d.
+    This allows the BN statistics to be updated during test-time adaptation.
+    """
+    module_output = module
+    if isinstance(module, FrozenBatchNorm2d):
+        # Create a new BatchNorm2d layer
+        bn = nn.BatchNorm2d(
+            module.num_features,
+            eps=module.eps,
+            momentum=0.1,
+            affine=True,
+            track_running_stats=True
         )
         
-        # Initialize adaptation layer near identity
-        for m in self.adapt.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.zeros_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+        # Copy weights and biases
+        bn.weight.data = module.weight.data.clone()
+        bn.bias.data = module.bias.data.clone()
+        
+        # Copy running statistics if they exist
+        if hasattr(module, 'running_mean'):
+            bn.running_mean.data = module.running_mean.data.clone()
+        if hasattr(module, 'running_var'):
+            bn.running_var.data = module.running_var.data.clone()
+        
+        module_output = bn
     
-    def forward(self, x):
-        return x + self.adapt(x)  # Residual connection
+    # Recursively apply to child modules
+    for name, child in module.named_children():
+        module_output.add_module(name, convert_frozen_batchnorm_to_batchnorm(child))
+    
+    del module
+    return module_output
+
+
+def save_bn_state(model):
+    """Save the current state of all BN layers."""
+    bn_state = {}
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            bn_state[name] = {
+                'weight': module.weight.data.clone() if module.weight is not None else None,
+                'bias': module.bias.data.clone() if module.bias is not None else None,
+                'running_mean': module.running_mean.clone(),
+                'running_var': module.running_var.clone(),
+                'num_batches_tracked': module.num_batches_tracked.clone()
+            }
+    return bn_state
+
+
+def restore_bn_state(model, bn_state):
+    """Restore BN layers to a saved state."""
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)) and name in bn_state:
+            state = bn_state[name]
+            if state['weight'] is not None:
+                module.weight.data.copy_(state['weight'])
+            if state['bias'] is not None:
+                module.bias.data.copy_(state['bias'])
+            module.running_mean.copy_(state['running_mean'])
+            module.running_var.copy_(state['running_var'])
+            module.num_batches_tracked.copy_(state['num_batches_tracked'])
+
+
+def reset_bn_stats(model):
+    """Reset BN running statistics to initial values."""
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            if module.track_running_stats:
+                module.running_mean.zero_()
+                module.running_var.fill_(1)
+                module.num_batches_tracked.zero_()
+
+
+def set_bn_to_train(model):
+    """Set all BN layers to training mode."""
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            module.train()
+
+
+def set_bn_to_eval(model):
+    """Set all BN layers to eval mode."""
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            module.eval()
 
 
 # ==============================================================
-# CUSTOM BACKBONE WITH ADAPTATION LAYER
+# DETECTRON2 SETUP WITH BN ADAPTATION
 # ==============================================================
 
-@BACKBONE_REGISTRY.register()
-class AdaptiveBackbone(Backbone):
+def setup_detectron2_for_bn_adaptation(device="cuda", checkpoint_path=None):
     """
-    Wrapper backbone that adds an adaptation layer to a specific feature level.
-    This backbone wraps an existing backbone and applies adaptation to one feature map.
-    """
-    def __init__(self, cfg, input_shape, base_backbone, feature_key='p4'):
-        super().__init__()
-        
-        self.base_backbone = base_backbone
-        self.feature_key = feature_key
-        
-        # Get the shape of the feature we want to adapt
-        base_output_shape = base_backbone.output_shape()
-        
-        if feature_key not in base_output_shape:
-            # If requested feature doesn't exist, use first available
-            available_keys = list(base_output_shape.keys())
-            print(f"⚠️  Feature '{feature_key}' not found. Available: {available_keys}")
-            self.feature_key = available_keys[0]
-            print(f"   Using '{self.feature_key}' instead")
-        
-        feature_channels = base_output_shape[self.feature_key].channels
-        
-        # Create adaptation layer
-        self.adaptation_layer = LightweightAdaptationLayer(feature_channels)
-        print(f"✅ Created adaptation layer for '{self.feature_key}' ({feature_channels} channels)")
-        
-        # Store output shape (same as base backbone)
-        self._output_shape = base_output_shape
-    
-    def forward(self, x):
-        """Forward pass with adaptation applied to specified feature"""
-        # Get features from base backbone
-        features = self.base_backbone(x)
-        
-        # Apply adaptation to the specified feature
-        if self.feature_key in features:
-            features[self.feature_key] = self.adaptation_layer(features[self.feature_key])
-        
-        return features
-    
-    def output_shape(self):
-        """Return output shape (same as base backbone)"""
-        return self._output_shape
-
-
-# ==============================================================
-# DETECTRON2 SETUP WITH ADAPTIVE BACKBONE
-# ==============================================================
-
-def setup_detectron2_with_adaptation(device="cuda", feature_key='p4', 
-                                     checkpoint_path=None):
-    """Setup Detectron2 model with adaptation layer inserted in backbone.
+    Setup Detectron2 model with BN layers converted for adaptation.
     
     Args:
         device: Device to load model on
-        feature_key: Which feature map to adapt (e.g., 'p4')
         checkpoint_path: Optional path to load weights from a previous checkpoint.
                         If None, loads COCO pretrained weights.
     """
@@ -163,119 +178,51 @@ def setup_detectron2_with_adaptation(device="cuda", feature_key='p4',
         "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.05
     
-    # First, build the base backbone
-    base_backbone = build_backbone(cfg)
-    base_backbone = base_backbone.to(device)
-    
-    # Test to see what features are available
-    with torch.no_grad():
-        dummy_input = torch.randn(1, 3, 800, 800).to(device)
-        dummy_features = base_backbone(dummy_input)
-    
-    print(f"📊 Available backbone features: {list(dummy_features.keys())}")
-    
-    # Choose feature to adapt (try p4 first, then others)
-    available_keys = list(dummy_features.keys())
-    if feature_key not in available_keys:
-        for key in ['p4', 'p3', 'p5', 'res4', 'res5']:
-            if key in available_keys:
-                feature_key = key
-                break
-        else:
-            feature_key = available_keys[0]
-    
-    # Create adaptive backbone wrapper
-    adaptive_backbone = AdaptiveBackbone(
-        cfg=cfg,
-        input_shape=None,
-        base_backbone=base_backbone,
-        feature_key=feature_key
-    ).to(device)
-    
-    # Build the full model with our custom backbone
-    # We need to manually construct the model
-    from detectron2.modeling.meta_arch import GeneralizedRCNN
-    from detectron2.modeling.proposal_generator import build_proposal_generator
-    from detectron2.modeling.roi_heads import build_roi_heads
-    
-    model = GeneralizedRCNN(
-        backbone=adaptive_backbone,
-        proposal_generator=build_proposal_generator(cfg, adaptive_backbone.output_shape()),
-        roi_heads=build_roi_heads(cfg, adaptive_backbone.output_shape()),
-        pixel_mean=cfg.MODEL.PIXEL_MEAN,
-        pixel_std=cfg.MODEL.PIXEL_STD,
-    )
-    
+    # Build model
+    model = build_model(cfg)
     model = model.to(device)
     
-    # Load pretrained weights using DetectionCheckpointer (same as original code)
+    # Load weights
     checkpointer = DetectionCheckpointer(model)
-    
-    # Determine which weights to load
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"   Loading weights from custom checkpoint: {checkpoint_path}")
-        weights_path = checkpoint_path
+        checkpointer.load(checkpoint_path)
     else:
         print("   Loading COCO pretrained weights...")
-        weights_path = cfg.MODEL.WEIGHTS
+        checkpointer.load(cfg.MODEL.WEIGHTS)
     
-    # Load with checkpointer - it handles remapping automatically
-    # Use strict=False to allow missing keys (adaptation layer)
-    loaded_dict = checkpointer._load_file(weights_path)
+    print(f"✅ Loaded weights successfully")
     
-    # Remap backbone keys: backbone.* -> backbone.base_backbone.*
-    if 'model' in loaded_dict:
-        state_dict = loaded_dict['model']
-    else:
-        state_dict = loaded_dict
+    # Count BN layers before conversion
+    frozen_bn_count = sum(1 for m in model.modules() if isinstance(m, FrozenBatchNorm2d))
+    print(f"   FrozenBatchNorm2d layers before conversion: {frozen_bn_count}")
     
-    remapped_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith('backbone.') and not k.startswith('backbone.base_backbone.'):
-            # Remap backbone keys
-            new_key = 'backbone.base_backbone.' + k[9:]
-            remapped_state_dict[new_key] = v
-        else:
-            remapped_state_dict[k] = v
+    # Convert FrozenBatchNorm2d to BatchNorm2d
+    print("   Converting FrozenBatchNorm2d to BatchNorm2d...")
+    model = convert_frozen_batchnorm_to_batchnorm(model)
     
-    # Load the remapped state dict
-    incompatible = checkpointer._load_model({"model": remapped_state_dict})
+    # Count BN layers after conversion
+    bn_count = sum(1 for m in model.modules() if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)))
+    frozen_bn_remaining = sum(1 for m in model.modules() if isinstance(m, FrozenBatchNorm2d))
+    print(f"   BatchNorm2d layers after conversion: {bn_count}")
+    print(f"   FrozenBatchNorm2d remaining: {frozen_bn_remaining}")
     
-    # Print loading info
-    if incompatible is not None:
-        adaptation_missing = [k for k in incompatible.missing_keys if 'adaptation_layer' in k]
-        other_missing = [k for k in incompatible.missing_keys if 'adaptation_layer' not in k]
-        
-        print(f"   ✅ Loaded weights successfully")
-        print(f"   - Adaptation layer keys (expected missing): {len(adaptation_missing)}")
-        if other_missing:
-            print(f"   ⚠️  Other missing keys: {len(other_missing)}")
-        if incompatible.unexpected_keys:
-            print(f"   ⚠️  Unexpected keys: {len(incompatible.unexpected_keys)}")
-    
-    # Freeze all parameters except adaptation layer
+    # Freeze all parameters except BN affine parameters
     for param in model.parameters():
         param.requires_grad = False
     
-    for param in adaptive_backbone.adaptation_layer.parameters():
-        param.requires_grad = True
-    
-    # Set appropriate modes
-    model.eval()
+    # Make BN affine parameters trainable
+    bn_params_trainable = 0
     for module in model.modules():
         if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            module.eval()
-
-    # Only adaptation layer's BN in training mode
-    for module in adaptive_backbone.adaptation_layer.modules():
-        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            module.train()
-
-    model.eval()
+            if module.weight is not None:
+                module.weight.requires_grad = True
+                bn_params_trainable += module.weight.numel()
+            if module.bias is not None:
+                module.bias.requires_grad = True
+                bn_params_trainable += module.bias.numel()
     
-    # Store reference to adaptation layer for easy access
-    model.adaptation_layer = adaptive_backbone.adaptation_layer
-    model.adaptation_feature_key = feature_key
+    print(f"   Trainable BN affine parameters: {bn_params_trainable:,}")
     
     return model, cfg
 
@@ -432,41 +379,6 @@ def compute_average_precision(precisions, recalls):
     return ap
 
 
-# ==============================================================
-# mAP COMPUTATION HELPERS
-# ==============================================================
-
-def compute_iou(box1, box2):
-    """Compute IoU between two boxes [x1, y1, x2, y2]"""
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    
-    intersection = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - intersection
-    
-    return intersection / union if union > 0 else 0
-
-
-def compute_average_precision(precisions, recalls):
-    """Compute AP from precision-recall curve"""
-    recalls = np.concatenate(([0.0], recalls, [1.0]))
-    precisions = np.concatenate(([0.0], precisions, [0.0]))
-    
-    # Make precision monotonically decreasing
-    for i in range(len(precisions) - 2, -1, -1):
-        precisions[i] = max(precisions[i], precisions[i + 1])
-    
-    # Find points where recall changes
-    indices = np.where(recalls[1:] != recalls[:-1])[0] + 1
-    ap = np.sum((recalls[indices] - recalls[indices - 1]) * precisions[indices])
-    
-    return ap
-
-
 def compute_map(predictions_list, ground_truths, iou_threshold=0.5, verbose=False):
     """Compute mAP across multiple images."""
     all_predictions = defaultdict(list)
@@ -563,52 +475,141 @@ def compute_map(predictions_list, ground_truths, iou_threshold=0.5, verbose=Fals
 
 
 # ==============================================================
-# ADAPTATION STEP
+# ENERGY MODEL UTILITIES
 # ==============================================================
 
-def adaptation_step(model, energy_model, image, device):
+def extract_roi_features(model, image_tensor, boxes):
     """
-    Perform one adaptation step using energy loss.
-    The adaptation layer is now inside the backbone, so we just do forward pass normally.
-    """
-    height, width = image.shape[:2]
-    image_tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).to(device)
+    Extract 7x7 ROI features from Detectron2 backbone using multi-level FPN.
+    This matches the extraction method used during energy model training.
     
-    # Forward pass (adaptation is applied inside backbone)
+    Args:
+        model: Detectron2 model with FPN backbone
+        image_tensor: Preprocessed image tensor [1, 3, H, W]
+        boxes: Tensor of boxes [N, 4] in format [x1, y1, x2, y2]
+    
+    Returns:
+        roi_feats: [N, 256, 7, 7] ROI-aligned features
+    """
+    # Extract FPN features
+    features = model.backbone(image_tensor)
+    
+    # Use multi-level pooling matching the detector
+    pooler = ROIPooler(
+        output_size=7,
+        # Include ALL pyramid levels that the detector uses
+        scales=tuple(1.0 / model.backbone.output_shape()[k].stride 
+                    for k in ["p2", "p3", "p4", "p5"]),
+        sampling_ratio=0,
+        pooler_type="ROIAlignV2"
+    )
+    
+    # Pool from ALL levels - ROIPooler automatically selects correct level per box
+    roi_boxes = [Boxes(boxes)]
+    roi_feats = pooler(
+        [features["p2"], features["p3"], features["p4"], features["p5"]],
+        roi_boxes
+    )
+    
+    return roi_feats
+
+
+def compute_energy_loss(model, energy_model, image_tensor, height, width, device, score_threshold=0.05):
+    """
+    Compute energy loss for the current predictions using ROI-aligned features.
+    
+    This implementation:
+    1. Runs detection to get predicted boxes
+    2. Extracts ROI-aligned features for each detection
+    3. Passes features through energy model
+    4. Returns mean energy as loss
+    
+    Args:
+        model: Detection model
+        energy_model: Trained ROI_EnergyModel
+        image_tensor: Input image tensor
+        height: Image height
+        width: Image width
+        device: Device
+        score_threshold: Minimum score for detections
+    
+    Returns:
+        energy_loss: Mean energy across all detections
+    """
+    # Preprocess image
     inputs = [{"image": image_tensor, "height": height, "width": width}]
     images = model.preprocess_image(inputs)
+    
+    # Get predictions
+    with torch.no_grad():
+        features = model.backbone(images.tensor)
+        proposals, _ = model.proposal_generator(images, features, None)
+        results, _ = model.roi_heads(images, features, proposals, None)
+        predictions = results[0]
+    
+    # Filter predictions by score
+    keep_mask = predictions.scores > score_threshold
+    
+    if keep_mask.sum() == 0:
+        # No detections, return small loss
+        return torch.tensor(0.01, device=device, requires_grad=True)
+    
+    # Filter to keep only confident predictions
+    pred_boxes = predictions.pred_boxes.tensor[keep_mask]
+    
+    # Extract ROI features for these boxes (requires grad for backprop)
+    # We need to re-compute features with gradients enabled
     features = model.backbone(images.tensor)
+    roi_feats = extract_roi_features(model, images.tensor, pred_boxes)
     
-    # Extract the adapted feature for energy computation
-    feature_key = model.adaptation_feature_key
-    adapted_features = features[feature_key]
+    # Compute energy for each ROI
+    energy_maps = energy_model(roi_feats)  # (N, 1, h, w)
     
-    # Compute energy
-    energy = energy_model(adapted_features)
-    energy_loss = energy.mean()
+    # Mean energy across all detections and spatial locations
+    energy_loss = energy_maps.mean()
     
-    return energy_loss, features
+    return energy_loss
 
 
-# ==============================================================
-# SEQUENTIAL TEST-TIME ADAPTATION
-# ==============================================================
-
-def sequential_test_time_adaptation(
+def bn_energy_adaptation(
     model,
     energy_model,
     dataset,
     device,
-    adaptation_lr=0.001,
+    adaptation_lr=0.01,
     iterations_per_image=3,
     score_threshold=0.05,
+    writer=None,
     verbose=False
 ):
-    """Sequential test-time adaptation with adaptation layer inside backbone."""
-    if not hasattr(model, 'adaptation_layer'):
-        raise ValueError("Model must have adaptation_layer attribute")
+    """
+    Sequential test-time adaptation using BN adaptation with energy guidance.
     
-    optimizer = optim.Adam(model.adaptation_layer.parameters(), lr=adaptation_lr)
+    Args:
+        model: Detectron2 model with BN layers
+        energy_model: Trained energy model for computing adaptation loss
+        dataset: List of image data dicts
+        device: Device to run on
+        adaptation_lr: Learning rate for BN affine parameter updates
+        iterations_per_image: Number of adaptation iterations per image
+        score_threshold: Score threshold for predictions
+        writer: TensorBoard writer
+        verbose: Whether to print detailed info
+    """
+    # Setup optimizer for BN affine parameters
+    bn_params = []
+    for module in model.modules():
+        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            if module.weight is not None:
+                bn_params.append(module.weight)
+            if module.bias is not None:
+                bn_params.append(module.bias)
+    
+    optimizer = optim.SGD(bn_params, lr=adaptation_lr, momentum=0.9)
+    print(f"Optimizing {len(bn_params)} BN affine parameters")
+    
+    # Save initial BN state
+    initial_bn_state = save_bn_state(model)
     
     results = {
         'map_before': [],
@@ -618,12 +619,14 @@ def sequential_test_time_adaptation(
         'num_detections_after': []
     }
     
-    # To evaluate "before" adaptation, we need to temporarily disable the adaptation layer
-    # We'll do this by saving/restoring the adaptation layer's parameters
+    global_step = 0
     
     # Process each image sequentially
     for img_idx, data in enumerate(dataset):
         print(f"[Image {img_idx + 1}/{len(dataset)}] {Path(data['image_path']).name}")
+        
+        # Reset BN to initial state before each image
+        restore_bn_state(model, initial_bn_state)
         
         # Load image
         image = cv2.imread(data['image_path'])
@@ -638,40 +641,20 @@ def sequential_test_time_adaptation(
             device
         )
         
-        # Evaluate BEFORE adaptation - temporarily make adaptation layer identity
-        # Save current adaptation weights
-        saved_state = {name: param.clone() for name, param in model.adaptation_layer.named_parameters()}
+        # Prepare image tensor
+        height, width = image.shape[:2]
+        image_tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).to(device)
         
-        # Zero out the adaptation layer to make it identity
-        with torch.no_grad():
-            for module in model.adaptation_layer.adapt.modules():
-                if isinstance(module, nn.Conv2d):
-                    module.weight.zero_()
-                    if module.bias is not None:
-                        module.bias.zero_()
-        
+        # ========================================
+        # Evaluate BEFORE adaptation
+        # ========================================
         model.eval()
-        for module in model.modules():
-            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                module.eval()
+        set_bn_to_eval(model)
         
         with torch.no_grad():
-            height, width = image.shape[:2]
-            image_tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).to(device)
-            
-            # Forward pass (adaptation layer is now identity)
             inputs = [{"image": image_tensor, "height": height, "width": width}]
-            images = model.preprocess_image(inputs)
-            features = model.backbone(images.tensor)
-            
-            proposals, _ = model.proposal_generator(images, features, None)
-            predictions_before, _ = model.roi_heads(images, features, proposals, None)
-            predictions_before = predictions_before[0]
-        
-        # Restore adaptation layer weights
-        with torch.no_grad():
-            for name, param in model.adaptation_layer.named_parameters():
-                param.copy_(saved_state[name])
+            outputs = model(inputs)
+            predictions_before = outputs[0]['instances']
         
         # Filter and remap predictions
         pred_before = filter_and_remap_predictions(predictions_before, score_threshold)
@@ -689,48 +672,50 @@ def sequential_test_time_adaptation(
                 print(f"    DEBUG - No predictions after filtering!")
             print(f"    DEBUG - Num GTs: {len(gt['boxes'])}, Num Preds: {len(pred_before['boxes'])}\n")
         
-        # Perform adaptation iterations
-        # Set adaptation layer BN to training mode
-        for module in model.adaptation_layer.modules():
-            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                module.train()
+        # ========================================
+        # Perform BN adaptation with energy guidance
+        # ========================================
+        model.eval()  # Keep model in eval mode
+        set_bn_to_train(model)  # But set BN to training mode
         
         total_energy_loss = 0
         for iter_idx in range(iterations_per_image):
             optimizer.zero_grad()
             
-            # Adaptation step (backbone will apply adaptation layer)
-            energy_loss, _ = adaptation_step(model, energy_model, image, device)
+            # Compute energy loss
+            energy_loss = compute_energy_loss(
+                model, energy_model, image_tensor, height, width, device
+            )
             
             if verbose and iter_idx == 0:
-                print(f"    DEBUG - Energy loss: {energy_loss.item():.4f}, requires_grad={energy_loss.requires_grad}")
+                print(f"    DEBUG - Energy loss: {energy_loss.item():.4f}")
             
             # Backward and optimize
             if torch.isfinite(energy_loss) and energy_loss.item() > 0:
                 energy_loss.backward()
                 optimizer.step()
                 total_energy_loss += energy_loss.item()
+                
+                # Log to TensorBoard
+                if writer is not None:
+                    writer.add_scalar('Energy/iter_loss', energy_loss.item(), global_step)
+                    global_step += 1
             else:
                 if verbose:
                     print(f"    Skipping iteration {iter_idx + 1} due to invalid loss")
         
         avg_energy_loss = total_energy_loss / iterations_per_image if iterations_per_image > 0 else 0
         
-        # Evaluate AFTER adaptation (with trained adaptation layer)
+        # ========================================
+        # Evaluate AFTER adaptation
+        # ========================================
         model.eval()
-        for module in model.modules():
-            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                module.eval()
+        set_bn_to_eval(model)
         
         with torch.no_grad():
-            # Forward pass (adaptation layer active)
             inputs = [{"image": image_tensor, "height": height, "width": width}]
-            images = model.preprocess_image(inputs)
-            features = model.backbone(images.tensor)
-            
-            proposals, _ = model.proposal_generator(images, features, None)
-            predictions_after, _ = model.roi_heads(images, features, proposals, None)
-            predictions_after = predictions_after[0]
+            outputs = model(inputs)
+            predictions_after = outputs[0]['instances']
         
         # Filter and remap predictions
         pred_after = filter_and_remap_predictions(predictions_after, score_threshold)
@@ -744,6 +729,15 @@ def sequential_test_time_adaptation(
         results['energy_losses'].append(avg_energy_loss)
         results['num_detections_before'].append(len(pred_before['boxes']))
         results['num_detections_after'].append(len(pred_after['boxes']))
+        
+        # Log to TensorBoard
+        if writer is not None:
+            writer.add_scalar('mAP/before', map_before, img_idx)
+            writer.add_scalar('mAP/after', map_after, img_idx)
+            writer.add_scalar('mAP/improvement', map_after - map_before, img_idx)
+            writer.add_scalar('Energy/avg_per_image', avg_energy_loss, img_idx)
+            writer.add_scalar('Detections/before', len(pred_before['boxes']), img_idx)
+            writer.add_scalar('Detections/after', len(pred_after['boxes']), img_idx)
         
         # Print results
         map_delta = map_after - map_before
@@ -772,8 +766,7 @@ def sequential_test_time_adaptation(
 def main():
     """Main function"""
     print("\n" + "=" * 60)
-    print("ETA for Object Detection - Motion Blurred Images")
-    print("WITH ADAPTATION LAYER INSIDE RESNET BACKBONE")
+    print("BN + Energy Adaptation for Object Detection")
     print("=" * 60)
     print()
     
@@ -782,46 +775,55 @@ def main():
         # MOTION BLURRED IMAGES DIRECTORY
         'image_dir': '/home/lyz6/AMROD/datasets/motion_blur/leftImg8bit/val',
         'annotation_file': '/home/lyz6/AMROD/datasets/cityscapes/annotations/instancesonly_filtered_gtFine_val.json',
-        'energy_model_path': '/home/lyz6/palmer_scratch/eta-object-detection/multiple_roi_energy_model_epoch2.pth',
+        
+        # Energy model path - trained using new_energy_model.py
+        'energy_model_path': 'models/multiple_roi_energy_model_epoch2.pth',
         
         # Optional: Load from previous checkpoint instead of COCO weights
-        # Set to None to use COCO pretrained weights
-        'checkpoint_path': None,  # e.g., '/path/to/your/previous_model.pth'
-        
-        'max_images': 20,
-        'adaptation_lr': 1e-2,
+        'checkpoint_path': None,
+        'max_images': 492,
+        'adaptation_lr': 0.01,  # Learning rate for BN affine parameters
         'iterations_per_image': 3,
         'score_threshold': 0.05,
+        
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'feature_key': 'p4'  # Which feature to adapt
     }
     
     device = torch.device(config['device'])
     print(f"Using device: {device}")
     print(f"Using MOTION BLURRED images from: {config['image_dir']}\n")
     
-    # Setup Detectron2 with adaptive backbone
-    print("[1/4] Setting up Detectron2 with adaptive backbone...")
-    model, cfg = setup_detectron2_with_adaptation(
-        device, 
-        feature_key=config['feature_key'],
+    # Setup TensorBoard
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_dir = f'runs/bn_energy_adaptation_{timestamp}'
+    writer = SummaryWriter(log_dir)
+    print(f"📊 TensorBoard logs: {log_dir}")
+    print(f"   View with: tensorboard --logdir={log_dir}\n")
+    
+    # Setup Detectron2 with BN adaptation
+    print("[1/4] Setting up Detectron2 with BN adaptation...")
+    model, cfg = setup_detectron2_for_bn_adaptation(
+        device,
         checkpoint_path=config['checkpoint_path']
     )
-    print("✅ Setup complete with adaptation layer inside backbone\n")
+    print("✅ Setup complete with BN layers ready for adaptation\n")
     
     # Load energy model
     print("[2/4] Loading trained energy model...")
     from new_energy_model import ROI_EnergyModel
     
-    # Determine energy model channels based on adapted feature
-    energy_channels = model.adaptation_layer.adapt[0].in_channels
-    print(f"   Energy model input channels: {energy_channels}")
+    # Energy model expects 256-channel ROI features (from FPN)
+    print(f"   Energy model: ROI-based, expects 256-channel 7x7 features")
     
-    energy_model = ROI_EnergyModel(in_channels=energy_channels).to(device)
+    energy_model = ROI_EnergyModel(in_channels=256).to(device)
     
     if os.path.exists(config['energy_model_path']):
         checkpoint = torch.load(config['energy_model_path'], map_location=device)
-        energy_model.load_state_dict(checkpoint)
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            energy_model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            energy_model.load_state_dict(checkpoint)
         print(f"✅ Loaded energy model from {config['energy_model_path']}\n")
     else:
         print(f"⚠️  Energy model not found at {config['energy_model_path']}")
@@ -845,16 +847,14 @@ def main():
     
     print()
     
-    # Run sequential adaptation
-    print("[4/4] Running sequential test-time adaptation...")
-    
-    # Count adaptable parameters
-    adaptable_params = [p for p in model.adaptation_layer.parameters() if p.requires_grad]
-    print(f"Adaptable parameters: {len(adaptable_params)}")
-    print(f"Total adaptable param count: {sum(p.numel() for p in adaptable_params):,}")
+    # Run BN + Energy adaptation
+    print("[4/4] Running BN adaptation with energy guidance...")
+    print(f"Adaptation LR: {config['adaptation_lr']}")
+    print(f"Iterations per image: {config['iterations_per_image']}")
+    print(f"Resetting BN to initial state before each image")
     print()
     
-    results = sequential_test_time_adaptation(
+    results = bn_energy_adaptation(
         model=model,
         energy_model=energy_model,
         dataset=dataset,
@@ -862,15 +862,20 @@ def main():
         adaptation_lr=config['adaptation_lr'],
         iterations_per_image=config['iterations_per_image'],
         score_threshold=config['score_threshold'],
+        writer=writer,
         verbose=True
     )
     
+    # Close TensorBoard writer
+    writer.close()
+    
     # Save results
-    output_file = 'sequential_adaptation_results_backbone_motion_blur.json'
+    output_file = 'bn_energy_adaptation_results.json'
     with open(output_file, 'w') as f:
         json_results = {k: [float(v) for v in vals] for k, vals in results.items()}
         json.dump(json_results, f, indent=2)
     print(f"\n✅ Results saved to {output_file}")
+    print(f"📊 TensorBoard logs saved to: {log_dir}")
 
 
 if __name__ == '__main__':

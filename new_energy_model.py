@@ -1,5 +1,5 @@
 """
-New Energy Model (ETA-style)
+New Energy Model (ETA-style) with TensorBoard Logging
 """
 
 import torch
@@ -15,6 +15,8 @@ import cv2, os, json, glob
 from tqdm import tqdm
 import numpy as np
 import random
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 # ===== Cityscapes → COCO class mapping =====
 CITYSCAPES_TO_COCO = {
@@ -156,18 +158,26 @@ def prepare_gt_instances(annotations, image_size, device):
 
 # ===== Compute per-detection error =====
 
-# Problem with IOU -- it is bounded between [-1, 1]
 def compute_detection_error(pred, gt):
     """L2-based unbounded error"""
     pred_boxes = pred.pred_boxes.tensor
     gt_boxes = gt.gt_boxes.tensor
     device = pred_boxes.device
 
-    if len(pred_boxes) == 0:
+    # Case 1: No predictions, no GT → no error needed (true negative)
+    if len(pred_boxes) == 0 and len(gt_boxes) == 0:
         return torch.tensor([], device=device)
+    
+    # Case 2: No predictions, but GT exists → complete failure (missed detections)
+    # Return high error for each missed GT box, which will map to energy ≈ 1
+    if len(pred_boxes) == 0:
+        return torch.ones(len(gt_boxes), device=device) * 100.0
+    
+    # Case 3: Predictions exist, no GT → false positives (high error)
     if len(gt_boxes) == 0:
         return torch.ones(len(pred_boxes), device=device) * 100.0
-
+    
+    # Case 4: Both predictions and GT exist → compute matching error
     # Centers and sizes
     pred_centers = (pred_boxes[:, :2] + pred_boxes[:, 2:]) / 2.0
     pred_sizes = pred_boxes[:, 2:] - pred_boxes[:, :2]
@@ -188,32 +198,6 @@ def compute_detection_error(pred, gt):
     best_error, _ = total_error.min(dim=1)
     
     return best_error
-
-"""
-def compute_detection_error(pred, gt):
-    Compute pure IoU-based error per detection (analog of MSE for depth).
-    Error = 1 - IoU (so perfect detection has error=0, no overlap has error=1)
-    pred_boxes = pred.pred_boxes
-    gt_boxes = gt.gt_boxes
-    device = pred_boxes.device
-
-    if len(pred_boxes) == 0:
-        return torch.tensor([], device=device)
-    if len(gt_boxes) == 0:
-        # No GT means all predictions are false positives → max error
-        return torch.ones(len(pred_boxes), device=device)
-
-    # Compute IoU matrix: (N_pred, N_gt)
-    iou = pairwise_iou(pred_boxes, gt_boxes)
-    
-    # For each prediction, find best matching GT box
-    best_iou, best_idx = iou.max(dim=1)
-    
-    # Error = 1 - IoU (pure geometric error)
-    error = 1.0 - best_iou
-    
-    return error
-"""
 
 # ===== Compute target energy (Gibbs transform) =====
 def compute_target_energy(errors, temperature=0.5):
@@ -284,8 +268,23 @@ def train_energy_model(
     temperature=0.5,
     batch_accum=32,        # <-- gradient accumulation steps
     device="cuda",
-    save_path="roi_energy_model.pth"
+    save_path="roi_energy_model.pth",
+    log_dir="runs"         # <-- TensorBoard log directory
 ):
+    # Setup TensorBoard
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    experiment_name = f"energy_model_T{temperature}_lr{learning_rate}_bs{batch_accum}_{timestamp}"
+    writer = SummaryWriter(os.path.join(log_dir, experiment_name))
+    
+    # Log hyperparameters
+    writer.add_text('Hyperparameters', f"""
+    - Learning Rate: {learning_rate}
+    - Temperature: {temperature}
+    - Batch Accumulation: {batch_accum}
+    - Num Epochs: {num_epochs}
+    - Device: {device}
+    """, 0)
+    
     # Setup models
     predictor = setup_detectron2(device)
     energy_model = ROI_EnergyModel(in_channels=256).to(device)
@@ -296,13 +295,22 @@ def train_energy_model(
     relevant_classes = [0, 1, 2, 3, 5, 6, 7]
 
     print(f"Training on {len(paired_data)} paired samples")
+    writer.add_text('Dataset', f'Total samples: {len(paired_data)}', 0)
 
+    global_step = 0
+    
     for epoch in range(num_epochs):
         energy_model.train()
         epoch_loss = 0.0
         num_batches = 0
         batch_loss = 0.0
         accum_count = 0
+        
+        # Track statistics per epoch
+        epoch_pred_energy_vals = []
+        epoch_target_energy_vals = []
+        epoch_error_vals = []
+        epoch_num_detections = []
 
         random.shuffle(paired_data)
 
@@ -318,19 +326,12 @@ def train_energy_model(
                 clean_out = predictor(clean_img)["instances"].to(device)
                 blur_out = predictor(blur_img)["instances"].to(device)
 
-            for pred in [clean_out, blur_out]:
+            for pred_idx, pred in enumerate([clean_out, blur_out]):
                 if len(pred) == 0 or len(gt) == 0:
                     continue
 
                 errors = compute_detection_error(pred, gt)
-                
-                """
-                print(f"Error stats - Min: {errors.min():.4f}, Max: {errors.max():.4f}, "
-                    f"Mean: {errors.mean():.4f}, Median: {errors.median():.4f}")
-                """
-
                 target_E = compute_target_energy(errors, temperature)
-
 
                 # Convert image to tensor and preprocess
                 img_tensor = torch.as_tensor(clean_img.astype("float32").transpose(2, 0, 1)).to(device)
@@ -345,7 +346,6 @@ def train_energy_model(
                 target_E_map = target_E.view(-1, 1, 1, 1).expand_as(pred_E_map)
 
                 # Binary cross-entropy loss
-                # loss = F.binary_cross_entropy(pred_E_map, target_E_map)
                 loss = F.mse_loss(pred_E_map, target_E_map)
 
                 # Accumulate gradients
@@ -354,35 +354,109 @@ def train_energy_model(
                 accum_count += 1
                 epoch_loss += loss.item()
                 num_batches += 1
-
-                if accum_count % batch_accum == 0:
-                    print(f"Pred E range: [{pred_E_map.min():.3f}, {pred_E_map.max():.3f}], "
-                        f"Target E range: [{target_E_map.min():.3f}, {target_E_map.max():.3f}]")
-
+                
+                # Collect statistics
+                epoch_pred_energy_vals.append(pred_E_map.detach().cpu())
+                epoch_target_energy_vals.append(target_E_map.detach().cpu())
+                epoch_error_vals.append(errors.detach().cpu())
+                epoch_num_detections.append(len(pred))
 
                 # Step optimizer every `batch_accum` samples
                 if accum_count % batch_accum == 0:
+                    # Log detailed batch statistics
+                    pred_E_min = pred_E_map.min().item()
+                    pred_E_max = pred_E_map.max().item()
+                    pred_E_mean = pred_E_map.mean().item()
+                    target_E_min = target_E_map.min().item()
+                    target_E_max = target_E_map.max().item()
+                    target_E_mean = target_E_map.mean().item()
+                    
+                    writer.add_scalar('Loss/batch', loss.item(), global_step)
+                    writer.add_scalar('Energy/predicted_min', pred_E_min, global_step)
+                    writer.add_scalar('Energy/predicted_max', pred_E_max, global_step)
+                    writer.add_scalar('Energy/predicted_mean', pred_E_mean, global_step)
+                    writer.add_scalar('Energy/target_min', target_E_min, global_step)
+                    writer.add_scalar('Energy/target_max', target_E_max, global_step)
+                    writer.add_scalar('Energy/target_mean', target_E_mean, global_step)
+                    writer.add_scalar('Error/min', errors.min().item(), global_step)
+                    writer.add_scalar('Error/max', errors.max().item(), global_step)
+                    writer.add_scalar('Error/mean', errors.mean().item(), global_step)
+                    writer.add_scalar('Detections/count', len(pred), global_step)
+                    
+                    global_step += 1
+                    
                     optimizer.step()
                     optimizer.zero_grad()
                     avg_batch_loss = batch_loss / batch_accum
-                    pbar.set_postfix({"avg_loss": f"{avg_batch_loss:.4f}", "N": len(pred)})
+                    pbar.set_postfix({
+                        "avg_loss": f"{avg_batch_loss:.4f}", 
+                        "N": len(pred),
+                        "E_pred": f"[{pred_E_min:.3f},{pred_E_max:.3f}]",
+                        "E_tgt": f"[{target_E_min:.3f},{target_E_max:.3f}]"
+                    })
                     batch_loss = 0.0
 
-        # Epoch summary
+        # Epoch summary statistics
         avg_epoch_loss = epoch_loss / max(num_batches, 1)
+        
+        # Compute epoch-level statistics
+        all_pred_energy = torch.cat(epoch_pred_energy_vals)
+        all_target_energy = torch.cat(epoch_target_energy_vals)
+        all_errors = torch.cat(epoch_error_vals)
+        
+        writer.add_scalar('Loss/epoch', avg_epoch_loss, epoch)
+        writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+        
+        # Summary statistics
+        writer.add_scalar('Summary/avg_pred_energy', all_pred_energy.mean().item(), epoch)
+        writer.add_scalar('Summary/avg_target_energy', all_target_energy.mean().item(), epoch)
+        writer.add_scalar('Summary/avg_error', all_errors.mean().item(), epoch)
+        writer.add_scalar('Summary/avg_detections_per_image', np.mean(epoch_num_detections), epoch)
+        writer.add_scalar('Summary/total_samples_processed', num_batches, epoch)
+        
+        # Energy alignment metric (how close predicted is to target)
+        energy_mse = F.mse_loss(all_pred_energy, all_target_energy).item()
+        energy_mae = F.l1_loss(all_pred_energy, all_target_energy).item()
+        writer.add_scalar('Metrics/energy_MSE', energy_mse, epoch)
+        writer.add_scalar('Metrics/energy_MAE', energy_mae, epoch)
+        
         print(f"\n✅ Epoch {epoch+1} complete — Avg Loss: {avg_epoch_loss:.4f}")
+        print(f"   Energy MSE: {energy_mse:.4f}, MAE: {energy_mae:.4f}")
+        print(f"   Pred Energy: [{all_pred_energy.min():.3f}, {all_pred_energy.max():.3f}], Mean: {all_pred_energy.mean():.3f}")
+        print(f"   Target Energy: [{all_target_energy.min():.3f}, {all_target_energy.max():.3f}], Mean: {all_target_energy.mean():.3f}")
 
         # Save checkpoint every 2 epochs
         if (epoch + 1) % 2 == 0:
             ckpt_path = save_path.replace(".pth", f"_epoch{epoch+1}.pth")
-            torch.save(energy_model.state_dict(), ckpt_path)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': energy_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_epoch_loss,
+            }, ckpt_path)
             print(f"Checkpoint saved: {ckpt_path}")
 
     # Final save
-    torch.save(energy_model.state_dict(), save_path)
+    torch.save({
+        'model_state_dict': energy_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'final_loss': avg_epoch_loss,
+        'hyperparameters': {
+            'learning_rate': learning_rate,
+            'temperature': temperature,
+            'batch_accum': batch_accum,
+            'num_epochs': num_epochs
+        }
+    }, save_path)
+    
     print(f"\n🎯 Training complete! Model saved to {save_path}")
+    print(f"📊 TensorBoard logs saved to: {os.path.join(log_dir, experiment_name)}")
+    
+    # Close writer
+    writer.close()
 
 # ===== Main =====
+# You should eventually switch to TRAIN LOL
 if __name__ == "__main__":
     CLEAN_DIR = "/home/lyz6/AMROD/datasets/cityscapes/leftImg8bit/val"
     BLUR_DIR = "/home/lyz6/AMROD/datasets/motion_blur/leftImg8bit/val"
@@ -392,9 +466,10 @@ if __name__ == "__main__":
         clean_dir=CLEAN_DIR,
         blur_dir=BLUR_DIR,
         ann_file=ANN_FILE,
-        num_epochs=3,
-        learning_rate=3e-4,
+        num_epochs=2,
+        learning_rate=5e-4,
         temperature=200,
         device="cuda",
-        save_path="multiple_roi_energy_model.pth"
+        save_path="models/multiple_roi_energy_model.pth",
+        log_dir="runs/energy_model"  # TensorBoard log directory
     )
