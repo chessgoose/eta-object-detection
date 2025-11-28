@@ -24,33 +24,17 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-# ==============================================================
-# CLASS MAPPING
-# ==============================================================
 
-CITYSCAPES_TO_COCO = {
+JSON_TO_MODEL_ID = {
     1: 0,  # person → person
-    2: 0,  # rider → person
+    2: 1,  # rider → rider
     3: 2,  # car → car
-    4: 1,  # bicycle → bicycle
-    5: 3,  # motorcycle → motorcycle
-    6: 5,  # bus → bus
-    7: 7,  # truck → truck
-    8: 6,  # train → train
+    4: 7,  # bicycle → bicycle (moves to end!)
+    5: 6,  # motorcycle → motorcycle
+    6: 4,  # bus → bus
+    7: 3,  # truck → truck
+    8: 5,  # train → train
 }
-
-COCO_CITYSCAPES_CLASSES = {
-    0: 0,   # person
-    1: 1,   # bicycle
-    2: 2,   # car
-    3: 3,   # motorcycle
-    5: 5,   # bus
-    6: 6,   # train
-    7: 7,   # truck
-}
-
-EVAL_CLASSES = [0, 1, 2, 3, 5, 6, 7]
-
 
 # ==============================================================
 # BN CONVERSION UTILITIES
@@ -115,10 +99,13 @@ def setup_detectron2_for_bn_adaptation(device="cuda", checkpoint_path=None):
                         If None, loads COCO pretrained weights.
     """
     cfg = get_cfg()
-    cfg.merge_from_file(model_zoo.get_config_file(
-        "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
-    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
-        "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+
+    # Use COCO Faster R-CNN config as base (NOT Mask R-CNN)
+    cfg.merge_from_file(model_zoo.get_config_file("COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"))
+    
+    # Override with Cityscapes-specific settings
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 8  # Cityscapes has 8 classes
+    cfg.MODEL.WEIGHTS = "/home/lyz6/palmer_scratch/eta-object-detection/detectron2/tools/output/res50_fbn_1x/cityscapes_train_final.pth"
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.05
     
     # Build model
@@ -131,7 +118,7 @@ def setup_detectron2_for_bn_adaptation(device="cuda", checkpoint_path=None):
         print(f"   Loading weights from custom checkpoint: {checkpoint_path}")
         checkpointer.load(checkpoint_path)
     else:
-        print("   Loading COCO pretrained weights...")
+        print("   Loading pretrained weights...")
         checkpointer.load(cfg.MODEL.WEIGHTS)
     
     print(f"✅ Loaded weights successfully")
@@ -178,15 +165,16 @@ def load_cityscapes_data(image_dir, annotation_file, max_images=None):
     """Load Cityscapes validation data."""
     with open(annotation_file, 'r') as f:
         coco_data = json.load(f)
-    
+
     # Build image_id to annotations mapping
     img_id_to_anns = defaultdict(list)
     for ann in coco_data['annotations']:
-        if ann['category_id'] in CITYSCAPES_TO_COCO:
+        # Remap from JSON category ID to model training ID
+        if ann['category_id'] in JSON_TO_MODEL_ID:
             ann_copy = ann.copy()
-            # Map to Cityscapes→COCO class
-            ann_copy['category_id'] = CITYSCAPES_TO_COCO[ann['category_id']]
+            ann_copy['category_id'] = JSON_TO_MODEL_ID[ann['category_id']]
             img_id_to_anns[ann['image_id']].append(ann_copy)
+    
     
     # Build dataset
     dataset = []
@@ -251,7 +239,7 @@ def prepare_gt_instances(annotations, image_size, device):
 # ==============================================================
 
 def filter_and_remap_predictions(predictions, score_threshold=0.05):
-    """Filter predictions to only keep Cityscapes-relevant COCO classes."""
+    """Filter predictions by score threshold only."""
     if not isinstance(predictions, Instances):
         return predictions
     
@@ -259,33 +247,14 @@ def filter_and_remap_predictions(predictions, score_threshold=0.05):
     pred_classes = predictions.pred_classes
     pred_scores = predictions.scores
     
-    # Filter by score
-    score_mask = pred_scores > score_threshold
-    
-    # Filter by relevant classes
-    class_mask = torch.zeros_like(score_mask)
-    for coco_class in COCO_CITYSCAPES_CLASSES.keys():
-        class_mask |= (pred_classes == coco_class)
-    
-    # Combined mask
-    keep_mask = score_mask & class_mask
-    
-    # Apply mask
-    filtered_boxes = pred_boxes[keep_mask]
-    filtered_classes = pred_classes[keep_mask]
-    filtered_scores = pred_scores[keep_mask]
-    
-    # Remap classes to evaluation IDs
-    remapped_classes = filtered_classes.clone()
-    for coco_id, eval_id in COCO_CITYSCAPES_CLASSES.items():
-        remapped_classes[filtered_classes == coco_id] = eval_id
+    # Filter by score only
+    keep_mask = pred_scores > score_threshold
     
     return {
-        'boxes': filtered_boxes,
-        'labels': remapped_classes,
-        'scores': filtered_scores
+        'boxes': pred_boxes[keep_mask],
+        'labels': pred_classes[keep_mask],
+        'scores': pred_scores[keep_mask]
     }
-
 
 # ==============================================================
 # mAP COMPUTATION
@@ -354,7 +323,7 @@ def compute_map(predictions_list, ground_truths, iou_threshold=0.5, verbose=Fals
     
     # Compute AP for each class
     aps = []
-    for class_id in EVAL_CLASSES:
+    for class_id in range(8):  # Cityscapes has classes 0-7
         if class_id not in all_predictions or class_id not in all_ground_truths:
             continue
         
@@ -461,6 +430,7 @@ def sequential_bn_adaptation(
 ):
     """
     Sequential test-time adaptation using BN adaptation.
+    Uses GLOBAL mAP computation (standard COCO-style evaluation).
     
     Args:
         model: Detectron2 model with BN layers
@@ -488,9 +458,12 @@ def sequential_bn_adaptation(
         optimizer = None
         print("Only updating BN statistics (not affine parameters)")
     
+    # Accumulate ALL predictions and ground truths for global mAP
+    all_preds_before = []
+    all_preds_after = []
+    all_gts = []
+    
     results = {
-        'map_before': [],
-        'map_after': [],
         'num_detections_before': [],
         'num_detections_after': []
     }
@@ -516,7 +489,9 @@ def sequential_bn_adaptation(
         height, width = image.shape[:2]
         image_tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).to(device)
         
+        # ========================================
         # Evaluate BEFORE adaptation (with eval mode BN)
+        # ========================================
         model.eval()
         set_bn_to_eval(model)
         
@@ -528,10 +503,7 @@ def sequential_bn_adaptation(
         # Filter and remap predictions
         pred_before = filter_and_remap_predictions(predictions_before, score_threshold)
         
-        # Compute mAP before
-        map_before = compute_map([pred_before], [gt], verbose=(verbose and img_idx == 0))
-        
-        # Debug info
+        # Debug info for first image only
         if verbose and img_idx == 0:
             print(f"\n    DEBUG - Ground truth classes: {gt['labels'].cpu().tolist()}")
             if len(pred_before['labels']) > 0:
@@ -541,7 +513,9 @@ def sequential_bn_adaptation(
                 print(f"    DEBUG - No predictions after filtering!")
             print(f"    DEBUG - Num GTs: {len(gt['boxes'])}, Num Preds: {len(pred_before['boxes'])}\n")
         
+        # ========================================
         # Perform BN adaptation iterations
+        # ========================================
         model.eval()  # Keep model in eval mode
         set_bn_to_train(model)  # But set BN to training mode for statistics update
         
@@ -591,7 +565,9 @@ def sequential_bn_adaptation(
                 with torch.no_grad():
                     outputs = model(inputs)
         
+        # ========================================
         # Evaluate AFTER adaptation (with eval mode BN using updated statistics)
+        # ========================================
         model.eval()
         set_bn_to_eval(model)
         
@@ -603,32 +579,81 @@ def sequential_bn_adaptation(
         # Filter and remap predictions
         pred_after = filter_and_remap_predictions(predictions_after, score_threshold)
         
-        # Compute mAP after
-        map_after = compute_map([pred_after], [gt], verbose=False)
+        # Accumulate for global mAP computation
+        all_preds_before.append(pred_before)
+        all_preds_after.append(pred_after)
+        all_gts.append(gt)
         
-        # Store results
-        results['map_before'].append(map_before)
-        results['map_after'].append(map_after)
+        # Store per-image metrics
         results['num_detections_before'].append(len(pred_before['boxes']))
         results['num_detections_after'].append(len(pred_after['boxes']))
         
-        # Print results
-        map_delta = map_after - map_before
-        print(f"  📊 mAP: {map_before:.3f} → {map_after:.3f} (Δ: {map_delta:+.3f})")
+        # Print per-image info
         print(f"  📦 Detections: {results['num_detections_before'][-1]} → {results['num_detections_after'][-1]}")
+        
+        # Compute and log intermediate global mAP every 50 images
+        if (img_idx + 1) % 50 == 0 or img_idx == 0:
+            intermediate_map_before = compute_map(all_preds_before, all_gts, verbose=False)
+            intermediate_map_after = compute_map(all_preds_after, all_gts, verbose=False)
+            print(f"  📊 Global mAP so far ({img_idx + 1} images): {intermediate_map_before:.3f} → {intermediate_map_after:.3f} (Δ: {intermediate_map_after - intermediate_map_before:+.3f})")
+        
         print()
     
+    # ========================================
+    # Compute GLOBAL mAP (standard COCO-style evaluation)
+    # ========================================
+    print("=" * 60)
+    print("Computing Global mAP (COCO-style evaluation)...")
+    print("=" * 60)
+    
+    print("\nBEFORE Adaptation:")
+    map_before_global = compute_map(all_preds_before, all_gts, verbose=True)
+    
+    print("\nAFTER Adaptation:")
+    map_after_global = compute_map(all_preds_after, all_gts, verbose=True)
+    
+    # Store global results
+    results['map_before_global'] = map_before_global
+    results['map_after_global'] = map_after_global
+    
     # Print final summary
+    print()
     print("=" * 60)
-    print("Final Results")
+    print("Final Results - GLOBAL mAP")
     print("=" * 60)
-    print(f"Average mAP before:  {np.mean(results['map_before']):.4f}")
-    print(f"Average mAP after:   {np.mean(results['map_after']):.4f}")
-    print(f"Average improvement: {np.mean(results['map_after']) - np.mean(results['map_before']):+.4f}")
+    print(f"Global mAP before:   {map_before_global:.4f}")
+    print(f"Global mAP after:    {map_after_global:.4f}")
+    print(f"Global improvement:  {map_after_global - map_before_global:+.4f}")
+    print(f"Total images:        {len(dataset)}")
     print("=" * 60)
     
     return results
 
+def run_no_adaptation_baseline(model, dataset, device, score_threshold=0.05):
+    model.eval()
+    set_bn_to_eval(model)   # freeze BN behavior
+    preds = []
+    gts = []
+    with torch.no_grad():
+        for data in dataset:
+            image = cv2.imread(data['image_path'])
+            if image is None: 
+                preds.append({'boxes': torch.zeros((0,4), device=device),
+                              'labels': torch.zeros((0,), dtype=torch.int64, device=device),
+                              'scores': torch.zeros((0,), device=device)})
+                gts.append(prepare_gt_instances(data['annotations'], (data['height'], data['width']), device))
+                continue
+
+            height, width = image.shape[:2]
+            image_tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).to(device)
+            inputs = [{"image": image_tensor, "height": height, "width": width}]
+            outputs = model(inputs)
+            predictions = outputs[0]['instances']
+            pred_filtered = filter_and_remap_predictions(predictions, score_threshold)
+            preds.append(pred_filtered)
+            gts.append(prepare_gt_instances(data['annotations'], (data['height'], data['width']), device))
+
+    return preds, gts
 
 # ==============================================================
 # MAIN
@@ -690,6 +715,17 @@ def main():
     print()
     
     # Run sequential BN adaptation
+
+    # Make a deep copy of the original model state for a clean baseline if you will adapt the same model
+    import copy
+    baseline_model = copy.deepcopy(model)
+
+    print("[0/3] Running true no-adaptation baseline pass...")
+    no_adapt_preds, no_adapt_gts = run_no_adaptation_baseline(baseline_model, dataset, device, score_threshold=config['score_threshold'])
+    map_no_adapt = compute_map(no_adapt_preds, no_adapt_gts, verbose=True)
+    print(f"True no-adaptation Global mAP: {map_no_adapt:.4f}\n")
+
+    """
     print("[3/3] Running sequential test-time BN adaptation...")
     print(f"Update affine parameters: {config['update_affine']}")
     print(f"Adaptation LR: {config['adaptation_lr']}")
@@ -714,6 +750,7 @@ def main():
         json.dump(json_results, f, indent=2)
     print(f"\n✅ Results saved to {output_file}")
 
-
+    """
+    
 if __name__ == '__main__':
     main()

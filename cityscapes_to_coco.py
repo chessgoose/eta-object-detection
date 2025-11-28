@@ -120,13 +120,11 @@ def xyxy_to_xywh(xyxy_box):
 def convert_cityscapes_instance_only(data_dir, out_dir):
     """Convert from cityscapes format to COCO instance seg format - polygons"""
     sets = [
-        'leftImg8bit/train',
-        'leftImg8bit/val'
+        'leftImg8bit/train'
     ]
 
     ann_dirs = [
-        'gtFine/train',
-        'gtFine/val',
+        'gtFine/train'
     ]
 
     json_name = 'instancesonly_filtered_%s.json'
@@ -151,6 +149,7 @@ def convert_cityscapes_instance_only(data_dir, out_dir):
         annotations = []
 
         for root, _, files in os.walk(os.path.join(data_dir, ann_dir)):
+            print(ann_dir)
             for filename in files:
                 if filename.endswith(polygon_json_file_ending):
 
@@ -158,7 +157,6 @@ def convert_cityscapes_instance_only(data_dir, out_dir):
                         print("Processed %s images, %s annotations" % (len(images), len(annotations)))
 
                     json_ann = json.load(open(os.path.join(root, filename)))
-
                     image = {}
                     image['id'] = img_id
                     img_id += 1

@@ -11,22 +11,20 @@ import os
 corruption_types = get_corruption_names()
 severity = 5
 root_dir =  "/home/lyz6/AMROD/datasets/"
-raw_cityscapes_dir = os.path.join(root_dir, "cityscapes/leftImg8bit/val")
-b = ['gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur', 'glass_blur', 'motion_blur', 'zoom_blur', 'snow', 'brightness', 'contrast', 'elastic_transform', 'pixelate', 'jpeg_compression']
+raw_cityscapes_dir = os.path.join(root_dir, "cityscapes/leftImg8bit/train")
+# b = ['gaussian_noise', 'shot_noise', 'impulse_noise', 'defocus_blur', 'glass_blur', 'motion_blur', 'zoom_blur', 'snow', 'brightness', 'contrast', 'elastic_transform', 'pixelate', 'jpeg_compression']
 print(corruption_types)
 
 for corruption in corruption_types:
     corrupt_root_dir = os.path.join(root_dir, corruption)
-    if corruption in b:
-        continue
-    else:
-        corrupt_cityscapes_dir = os.path.join(root_dir, corruption+"/leftImg8bit/val")
+    if corruption == 'defocus_blur':
+        print(corruption)
+        corrupt_cityscapes_dir = os.path.join(root_dir, corruption+"/leftImg8bit/train")
         if not os.path.exists(corrupt_cityscapes_dir):
             os.makedirs(corrupt_cityscapes_dir)
-        print(corruption)
         for root, _, files in os.walk(raw_cityscapes_dir):
             city = root.split("/")[-1]
-            if city == "val":
+            if city == "train":
                 continue
             corrupt_cityscapes_city_dir = os.path.join(corrupt_cityscapes_dir, city)
             if not os.path.exists(corrupt_cityscapes_city_dir):

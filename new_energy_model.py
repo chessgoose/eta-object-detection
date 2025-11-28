@@ -1,16 +1,18 @@
 """
 New Energy Model (ETA-style) with TensorBoard Logging
+FIXED: Uses Cityscapes-trained Detectron2 model and correct label mapping
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from detectron2.engine import DefaultPredictor
+from detectron2.modeling import build_model
 from detectron2.config import get_cfg
 from detectron2 import model_zoo
 from detectron2.structures import Boxes, Instances, pairwise_iou
 from detectron2.modeling.poolers import ROIPooler
+from detectron2.checkpoint import DetectionCheckpointer
 import cv2, os, json, glob
 from tqdm import tqdm
 import numpy as np
@@ -18,16 +20,16 @@ import random
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
-# ===== Cityscapes → COCO class mapping =====
-CITYSCAPES_TO_COCO = {
-    1: 0,  # person
-    2: 0,  # rider → person
-    3: 2,  # car
-    4: 1,  # bicycle
-    5: 3,  # motorcycle
-    6: 5,  # bus
-    7: 7,  # truck
-    8: 6,  # train
+# ===== CORRECT MAPPING: JSON category IDs (1-8) → Model training IDs (0-7) =====
+JSON_TO_MODEL_ID = {
+    1: 0,  # person → person
+    2: 1,  # rider → rider
+    3: 2,  # car → car
+    4: 7,  # bicycle → bicycle (moves to end!)
+    5: 6,  # motorcycle → motorcycle
+    6: 4,  # bus → bus
+    7: 3,  # truck → truck
+    8: 5,  # train → train
 }
 
 
@@ -68,26 +70,37 @@ class ROI_EnergyModel(nn.Module):
         x = self.conv_layers(roi_feats)
         return self.sigmoid(self.final_conv(x))
 
-def energy_loss(pred_energy, target_energy):
-    eps = 1e-8
-    pred = pred_energy.view(pred_energy.size(0), -1)
-    target = target_energy.view(target_energy.size(0), -1)
-    pred = pred / (pred.sum(dim=1, keepdim=True) + eps)
-    target = target / (target.sum(dim=1, keepdim=True) + eps)
-    loss = torch.sum(target * torch.log((target + eps) / (pred + eps)), dim=1)
-    return torch.mean(loss)
 
-
-# ===== Detectron2 Setup =====
+# ===== FIXED: Setup Cityscapes-trained Detectron2 model =====
 def setup_detectron2(device="cuda"):
+    """
+    Setup Detectron2 model trained on Cityscapes (NOT COCO!)
+    """
     cfg = get_cfg()
-    cfg.merge_from_file(model_zoo.get_config_file(
-        "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
-    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
-        "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+    
+    # Use COCO Faster R-CNN config as base architecture
+    cfg.merge_from_file(model_zoo.get_config_file("COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"))
+    
+    # Override with Cityscapes-specific settings
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 8  # Cityscapes has 8 classes
+    cfg.MODEL.WEIGHTS = "/home/lyz6/palmer_scratch/eta-object-detection/detectron2/tools/output/res50_fbn_1x/cityscapes_train_final.pth"
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.05
     cfg.MODEL.DEVICE = device
-    return DefaultPredictor(cfg)
+    
+    # Build model
+    model = build_model(cfg)
+    model.to(device)
+    
+    # Load Cityscapes-trained weights
+    checkpointer = DetectionCheckpointer(model)
+    checkpointer.load(cfg.MODEL.WEIGHTS)
+    
+    model.eval()
+    
+    print("✅ Loaded Cityscapes-trained Detectron2 model")
+    print(f"   Model has {cfg.MODEL.ROI_HEADS.NUM_CLASSES} classes (Cityscapes)")
+    
+    return model, cfg
 
 
 # ===== Load paired dataset (across all cities) =====
@@ -95,14 +108,16 @@ def load_paired_data(clean_dir, blur_dir, ann_file):
     with open(ann_file, "r") as f:
         coco_data = json.load(f)
 
+    # FIXED: Use correct mapping from JSON IDs to model training IDs
     img_id_to_anns = {}
     for ann in coco_data["annotations"]:
         img_id = ann["image_id"]
-        if ann["category_id"] in CITYSCAPES_TO_COCO:
+        if ann["category_id"] in JSON_TO_MODEL_ID:
             if img_id not in img_id_to_anns:
                 img_id_to_anns[img_id] = []
             ann_copy = ann.copy()
-            ann_copy["category_id"] = CITYSCAPES_TO_COCO[ann["category_id"]]
+            # Convert from JSON category ID (1-8) to model training ID (0-7)
+            ann_copy["category_id"] = JSON_TO_MODEL_ID[ann["category_id"]]
             img_id_to_anns[img_id].append(ann_copy)
 
     paired_data = []
@@ -150,14 +165,13 @@ def prepare_gt_instances(annotations, image_size, device):
     for ann in annotations:
         x, y, w, h = ann["bbox"]
         boxes.append([x, y, x + w, y + h])
-        classes.append(ann["category_id"])
+        classes.append(ann["category_id"])  # Already remapped to 0-7
     gt.gt_boxes = Boxes(torch.tensor(boxes, dtype=torch.float32, device=device))
     gt.gt_classes = torch.tensor(classes, dtype=torch.int64, device=device)
     return gt
 
 
 # ===== Compute per-detection error =====
-
 def compute_detection_error(pred, gt):
     """L2-based unbounded error"""
     pred_boxes = pred.pred_boxes.tensor
@@ -169,7 +183,6 @@ def compute_detection_error(pred, gt):
         return torch.tensor([], device=device)
     
     # Case 2: No predictions, but GT exists → complete failure (missed detections)
-    # Return high error for each missed GT box, which will map to energy ≈ 1
     if len(pred_boxes) == 0:
         return torch.ones(len(gt_boxes), device=device) * 100.0
     
@@ -178,7 +191,6 @@ def compute_detection_error(pred, gt):
         return torch.ones(len(pred_boxes), device=device) * 100.0
     
     # Case 4: Both predictions and GT exist → compute matching error
-    # Centers and sizes
     pred_centers = (pred_boxes[:, :2] + pred_boxes[:, 2:]) / 2.0
     pred_sizes = pred_boxes[:, 2:] - pred_boxes[:, :2]
     
@@ -199,40 +211,17 @@ def compute_detection_error(pred, gt):
     
     return best_error
 
+
 # ===== Compute target energy (Gibbs transform) =====
 def compute_target_energy(errors, temperature=0.5):
     return (1.0 - torch.exp(-errors / temperature)).clamp(0, 1)
 
-# ===== Extract RoI features =====
 
+# ===== Extract RoI features =====
 def extract_roi_features(model, image_tensor, boxes):
     """
     Extract 7x7 ROI features from Detectron2 backbone using multi-level FPN.
-    
-    CRITICAL FIX: Now uses the SAME multi-level pooling as the detector!
-    
-    WHY THIS MATTERS:
-    - Detectron2's FPN assigns boxes to different pyramid levels by size:
-        * Small boxes (area < 96²) → p2 (stride 4, high resolution)
-        * Medium boxes → p3 (stride 8)
-        * Large boxes (area > 384²) → p4/p5 (stride 16/32, low resolution)
-    
-    - The OLD code only used p2, so:
-        ❌ Large boxes got wrong features (should be p4/p5, got p2)
-        ❌ Energy model saw DIFFERENT info than what produced predictions
-    
-    - This FIXED code uses multi-level pooling:
-        ✅ Each box gets features from appropriate pyramid level
-        ✅ Energy model sees SAME features as detector
-        ✅ Better alignment between predictions and energy scores
-    
-    Args:
-        model: Detectron2 model with FPN backbone
-        image_tensor: Preprocessed image tensor [1, 3, H, W]
-        boxes: Tensor of boxes [N, 4] in format [x1, y1, x2, y2]
-    
-    Returns:
-        roi_feats: [N, 256, 7, 7] ROI-aligned features from appropriate pyramid levels
+    Uses the SAME multi-level pooling as the detector for proper alignment.
     """
     from detectron2.modeling.poolers import ROIPooler
     from detectron2.structures import Boxes
@@ -240,17 +229,16 @@ def extract_roi_features(model, image_tensor, boxes):
     # Extract FPN features
     features = model.backbone(image_tensor)
     
-    # CRITICAL: Use multi-level pooling matching the detector
+    # Use multi-level pooling matching the detector
     pooler = ROIPooler(
         output_size=7,
-        # Include ALL pyramid levels that the detector uses
         scales=tuple(1.0 / model.backbone.output_shape()[k].stride 
                     for k in ["p2", "p3", "p4", "p5"]),
         sampling_ratio=0,
         pooler_type="ROIAlignV2"
     )
     
-    # Pool from ALL levels - ROIPooler automatically selects correct level per box
+    # Pool from ALL levels
     roi_boxes = [Boxes(boxes)]
     roi_feats = pooler(
         [features["p2"], features["p3"], features["p4"], features["p5"]],
@@ -259,6 +247,28 @@ def extract_roi_features(model, image_tensor, boxes):
     
     return roi_feats
 
+
+def run_inference(model, cfg, image):
+    """
+    Run inference using the Cityscapes-trained model.
+    Returns Instances object with predictions.
+    """
+    device = next(model.parameters()).device
+    height, width = image.shape[:2]
+    
+    # Preprocess image
+    image_tensor = torch.as_tensor(image.astype("float32").transpose(2, 0, 1)).to(device)
+    inputs = [{"image": image_tensor, "height": height, "width": width}]
+    
+    with torch.no_grad():
+        images = model.preprocess_image(inputs)
+        features = model.backbone(images.tensor)
+        proposals, _ = model.proposal_generator(images, features, None)
+        results, _ = model.roi_heads(images, features, proposals, None)
+    
+    return results[0]
+
+
 def train_energy_model(
     clean_dir,
     blur_dir,
@@ -266,10 +276,10 @@ def train_energy_model(
     num_epochs=10,
     learning_rate=1e-4,
     temperature=0.5,
-    batch_accum=32,        # <-- gradient accumulation steps
+    batch_accum=32,
     device="cuda",
     save_path="roi_energy_model.pth",
-    log_dir="runs"         # <-- TensorBoard log directory
+    log_dir="runs"
 ):
     # Setup TensorBoard
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -283,16 +293,16 @@ def train_energy_model(
     - Batch Accumulation: {batch_accum}
     - Num Epochs: {num_epochs}
     - Device: {device}
+    - Using Cityscapes-trained Detectron2 model
     """, 0)
     
-    # Setup models
-    predictor = setup_detectron2(device)
+    # FIXED: Setup Cityscapes-trained model
+    model, cfg = setup_detectron2(device)
     energy_model = ROI_EnergyModel(in_channels=256).to(device)
     optimizer = optim.Adam(energy_model.parameters(), lr=learning_rate)
 
     # Load dataset
     paired_data = load_paired_data(clean_dir, blur_dir, ann_file)
-    relevant_classes = [0, 1, 2, 3, 5, 6, 7]
 
     print(f"Training on {len(paired_data)} paired samples")
     writer.add_text('Dataset', f'Total samples: {len(paired_data)}', 0)
@@ -322,11 +332,12 @@ def train_energy_model(
             H, W = data["height"], data["width"]
             gt = prepare_gt_instances(data["annotations"], (H, W), device)
 
+            # FIXED: Use our inference function
             with torch.no_grad():
-                clean_out = predictor(clean_img)["instances"].to(device)
-                blur_out = predictor(blur_img)["instances"].to(device)
+                clean_out = run_inference(model, cfg, clean_img)
+                blur_out = run_inference(model, cfg, blur_img)
 
-            for pred_idx, pred in enumerate([clean_out, blur_out]):
+            for pred_idx, (pred, img) in enumerate([(clean_out, clean_img), (blur_out, blur_img)]):
                 if len(pred) == 0 or len(gt) == 0:
                     continue
 
@@ -334,18 +345,18 @@ def train_energy_model(
                 target_E = compute_target_energy(errors, temperature)
 
                 # Convert image to tensor and preprocess
-                img_tensor = torch.as_tensor(clean_img.astype("float32").transpose(2, 0, 1)).to(device)
+                img_tensor = torch.as_tensor(img.astype("float32").transpose(2, 0, 1)).to(device)
                 inputs = [{"image": img_tensor}]
-                image_list = predictor.model.preprocess_image(inputs)
+                image_list = model.preprocess_image(inputs)
 
                 # Extract ROI features
-                roi_feats = extract_roi_features(predictor.model, image_list.tensor, pred.pred_boxes.tensor)
+                roi_feats = extract_roi_features(model, image_list.tensor, pred.pred_boxes.tensor)
 
                 # Forward pass
-                pred_E_map = energy_model(roi_feats)  # (N, 1, h, w)
+                pred_E_map = energy_model(roi_feats)
                 target_E_map = target_E.view(-1, 1, 1, 1).expand_as(pred_E_map)
 
-                # Binary cross-entropy loss
+                # MSE loss
                 loss = F.mse_loss(pred_E_map, target_E_map)
 
                 # Accumulate gradients
@@ -363,7 +374,6 @@ def train_energy_model(
 
                 # Step optimizer every `batch_accum` samples
                 if accum_count % batch_accum == 0:
-                    # Log detailed batch statistics
                     pred_E_min = pred_E_map.min().item()
                     pred_E_max = pred_E_map.max().item()
                     pred_E_mean = pred_E_map.mean().item()
@@ -396,25 +406,19 @@ def train_energy_model(
                     })
                     batch_loss = 0.0
 
-        # Epoch summary statistics
+        # Epoch summary
         avg_epoch_loss = epoch_loss / max(num_batches, 1)
-        
-        # Compute epoch-level statistics
         all_pred_energy = torch.cat(epoch_pred_energy_vals)
         all_target_energy = torch.cat(epoch_target_energy_vals)
         all_errors = torch.cat(epoch_error_vals)
         
         writer.add_scalar('Loss/epoch', avg_epoch_loss, epoch)
         writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
-        
-        # Summary statistics
         writer.add_scalar('Summary/avg_pred_energy', all_pred_energy.mean().item(), epoch)
         writer.add_scalar('Summary/avg_target_energy', all_target_energy.mean().item(), epoch)
         writer.add_scalar('Summary/avg_error', all_errors.mean().item(), epoch)
         writer.add_scalar('Summary/avg_detections_per_image', np.mean(epoch_num_detections), epoch)
-        writer.add_scalar('Summary/total_samples_processed', num_batches, epoch)
         
-        # Energy alignment metric (how close predicted is to target)
         energy_mse = F.mse_loss(all_pred_energy, all_target_energy).item()
         energy_mae = F.l1_loss(all_pred_energy, all_target_energy).item()
         writer.add_scalar('Metrics/energy_MSE', energy_mse, epoch)
@@ -425,7 +429,7 @@ def train_energy_model(
         print(f"   Pred Energy: [{all_pred_energy.min():.3f}, {all_pred_energy.max():.3f}], Mean: {all_pred_energy.mean():.3f}")
         print(f"   Target Energy: [{all_target_energy.min():.3f}, {all_target_energy.max():.3f}], Mean: {all_target_energy.mean():.3f}")
 
-        # Save checkpoint every 2 epochs
+        # Save checkpoint
         if (epoch + 1) % 2 == 0:
             ckpt_path = save_path.replace(".pth", f"_epoch{epoch+1}.pth")
             torch.save({
@@ -450,17 +454,17 @@ def train_energy_model(
     }, save_path)
     
     print(f"\n🎯 Training complete! Model saved to {save_path}")
-    print(f"📊 TensorBoard logs saved to: {os.path.join(log_dir, experiment_name)}")
+    print(f"📊 TensorBoard logs: {os.path.join(log_dir, experiment_name)}")
     
-    # Close writer
     writer.close()
 
+
 # ===== Main =====
-# You should eventually switch to TRAIN LOL
 if __name__ == "__main__":
-    CLEAN_DIR = "/home/lyz6/AMROD/datasets/cityscapes/leftImg8bit/val"
-    BLUR_DIR = "/home/lyz6/AMROD/datasets/motion_blur/leftImg8bit/val"
-    ANN_FILE = "/home/lyz6/AMROD/datasets/cityscapes/annotations/instancesonly_filtered_gtFine_val.json"
+    CORRUPTION = "motion_blur"
+    CLEAN_DIR = "/home/lyz6/AMROD/datasets/cityscapes/leftImg8bit/train"
+    BLUR_DIR = f"/home/lyz6/AMROD/datasets/{CORRUPTION}/leftImg8bit/train"
+    ANN_FILE = "/home/lyz6/AMROD/datasets/cityscapes/annotations/instancesonly_filtered_gtFine_train.json"
 
     train_energy_model(
         clean_dir=CLEAN_DIR,
@@ -470,6 +474,6 @@ if __name__ == "__main__":
         learning_rate=5e-4,
         temperature=200,
         device="cuda",
-        save_path="models/multiple_roi_energy_model.pth",
-        log_dir="runs/energy_model"  # TensorBoard log directory
+        save_path=f"models/{CORRUPTION}_roi_energy_model.pth",
+        log_dir="runs/energy_model"
     )
