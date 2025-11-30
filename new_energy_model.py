@@ -461,7 +461,8 @@ def train_energy_model(
 
 # ===== Main =====
 if __name__ == "__main__":
-    CORRUPTION = "motion_blur"
+    CORRUPTION = "snow"
+    # 	 defocus_blur, fog, frost, , snow
     CLEAN_DIR = "/home/lyz6/AMROD/datasets/cityscapes/leftImg8bit/train"
     BLUR_DIR = f"/home/lyz6/AMROD/datasets/{CORRUPTION}/leftImg8bit/train"
     ANN_FILE = "/home/lyz6/AMROD/datasets/cityscapes/annotations/instancesonly_filtered_gtFine_train.json"
@@ -472,8 +473,10 @@ if __name__ == "__main__":
         ann_file=ANN_FILE,
         num_epochs=2,
         learning_rate=5e-4,
-        temperature=200,
+        temperature=200, # 200 for everything?
         device="cuda",
         save_path=f"models/{CORRUPTION}_roi_energy_model.pth",
         log_dir="runs/energy_model"
     )
+
+    # 3e-4 for motion_blur

@@ -768,28 +768,34 @@ def main():
     print()
     
     # Configuration
+    CORRUPTION = "defocus_blur"
     config = {
         # MOTION BLURRED IMAGES DIRECTORY
-        'image_dir': '/home/lyz6/AMROD/datasets/motion_blur/leftImg8bit/val',
+        'image_dir': f'/home/lyz6/AMROD/datasets/{CORRUPTION}/leftImg8bit/val',
         'annotation_file': '/home/lyz6/AMROD/datasets/cityscapes/annotations/instancesonly_filtered_gtFine_val.json',
         
         # Energy model path - trained using new_energy_model.py
-        'energy_model_path': 'models/motion_blur_roi_energy_model_epoch2.pth',
+        'energy_model_path': f'models/{CORRUPTION}_roi_energy_model_epoch2.pth',
         
         # Optional: Load from previous checkpoint instead of COCO weights
         'checkpoint_path': None,
         'max_images': 492,
-        'adaptation_lr': 2,  # Learning rate for BN affine parameters
-        'iterations_per_image': 5,
+        'adaptation_lr': 1,  # Learning rate for BN affine parameters
+        'iterations_per_image': 1,
         'score_threshold': 0.05,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     }
 
-    # 1e-5 == 0.1469, 
+    # Learning Rates:
+    # 0.2 for SNOW
+    # 2 for MOTION
+    # 0,3 for FOG
+    # for DEFOCUS
+    # for BRIGHTNESS
     
     device = torch.device(config['device'])
     print(f"Using device: {device}")
-    print(f"Using MOTION BLURRED images from: {config['image_dir']}\n")
+    print(f"Using CORRUPTED images from: {config['image_dir']}\n")
     
     # Setup TensorBoard
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
