@@ -1,111 +1,214 @@
-# Exploring Test-Time Adaptation for Object Detection in Continually Changing Environments
-
-[![Framework: PyTorch](https://img.shields.io/badge/Framework-PyTorch-orange.svg)](https://pytorch.org/) 
+# Energy-Based Test-Time Adaptation for Object Detection
 
 <p align="center">
-  <img src="model.png"/ width="1200">
+  <img src="model.png" width="1200">
 </p>
 
+## Overview
+
+This repository implements a new framework for robust object detection under domain shifts and image corruptions.
+
+---
+
 ## Contents
-1. [Installation Instructions](#installation-instructions)
+1. [Installation](#installation)
 2. [Dataset Preparation](#dataset-preparation)
-3. [Execution Instructions](#execution-instructions)
-    - [Source Pretraining](#source-pretraining)
-    - [Adaptation](#adaptation)
-4. [Acknowledgement](#acknowledgement)
+3. [Project Structure](#project-structure)
+4. [Usage](#usage)
+   - [Training the Energy Model](#1-training-the-energy-model)
+   - [Running Adaptation](#2-running-adaptation)
+   - [Visualization](#3-visualization)
+5. [Acknowledgements](#acknowledgements)
 
-## Installation Instructions
-- We use Python 3.8, PyTorch 1.9.0 (CUDA 11.1 build).
-- We codebase is built on [Detectron2](https://github.com/facebookresearch/detectron2).
+---
 
-```angular2
-conda create -n AMROD python=3.8
+## Installation
 
-Conda activate AMROD
+**Requirements:**
+- Python 3.8
+- PyTorch 1.9.0 (CUDA 11.1)
+- Detectron2
 
-pip install torch==1.9.0+cu111 torchvision==0.10.0+cu111 torchaudio==0.9.0 -f https://download.pytorch.org/whl/torch_stable.html
+**Setup:**
+```bash
+# Create conda environment
+conda create -n ETAOD python=3.8
+conda activate ETAOD
+
+# Install PyTorch
+pip install torch==1.9.0+cu111 torchvision==0.10.0+cu111 torchaudio==0.9.0 \
+    -f https://download.pytorch.org/whl/torch_stable.html
+
+# Install other dependencies
 pip install -r requirements.txt
 
-cd AMROD
-python -m pip install -e detectron2
+# Install Detectron2
 cd detectron2
-cd tools
+python -m pip install -e .
 ```
 
+---
 
 ## Dataset Preparation
 
-* **Cityscapes-C**: Please refer to the official website [Cityscapes](https://www.cityscapes-dataset.com/downloads/) to download the validation set and the label of the Cityscapes (leftImg8bit_trainvaltest.zip and gtFine_trainvaltest.zip), and covert the label format into coco format by cityscapes_to_coco.py (refer to [link](https://github.com/TillBeemelmanns/cityscapes-to-coco-conversion). This is optional since detectron provide register method for cityscapes format.). Then apply the 12 corruptions at the severity level 5 to the validation set of clean cityscapes with corrupt.py (refer to [link](https://github.com/bethgelab/imagecorruptions)) to get Cityscapes-C.
-* **SHIFT**: Please refer to the official website [SHIFT](https://www.vis.xyz/shift/) to download the front view of val set of the SHIFT-discrete and covert the Scalabel format into coco format (refer to /scalabel/label/to_coco.py in the [link](https://github.com/scalabel/scalabel)) for different condition based on the "weather_coarse" attributes.
-* **ACDC**: Please refer to to the official website [ACDC](https://acdc.vision.ee.ethz.ch/download) to download the validation set and the label of ACDC.
+### 1. Download Cityscapes
+Download from [Cityscapes official website](https://www.cityscapes-dataset.com/downloads/):
+- `leftImg8bit_trainvaltest.zip` (11GB) - Images
+- `gtFine_trainvaltest.zip` (241MB) - Annotations
 
-Make sure that the AMROD is placed in the current user directory for dataset register. Download all the dataset into "AMROD/datasets" folder in the COCO format. 
-Please refer to AMROD/detectron2/detectron2/data/datasets/builtin.py for the code of dataset register.
+### 2. Generate Corrupted Images
+Apply corruptions to the validation set using [imagecorruptions](https://github.com/bethgelab/imagecorruptions):
 
-Please follow dataset structure below:
-```
-    - AMROD
-        - datasets
-            - ACDC
-                - gt_detection
-                    - fog
-                        - instancesonly_fog_val_gt_detection.json
-                    - night
-                    ...
-                - rgb_anon
-                    - fog
-                    - night
-                    ...
-            - shift
-                - annotations
-                    - gtfine_cloudy_val.json
-                    - gtfine_foggy_val.json
-                    ...
-                - rgb_anon
-                    - images
-                        - val
-                            - front
-                                - 0aee-69fd
-                                ...             
-            - fog
-                - annotations
-                    - instancesonly_filtered_gtFine_val.json
-                - leftImg8bit
-                    - val
-                        - frankfurt
-                        ...
-            - frost
-                - annotations
-                    - instancesonly_filtered_gtFine_val.json
-                - leftImg8bit
-                    - val
-                        - frankfurt
-                        ...
-            ...
-        - detectron2
-        ...
+```bash
+python preprocessing/corrupt.py \
+    --input datasets/cityscapes/leftImg8bit/val \
+    --output datasets/{corruption_type}/leftImg8bit/val \
+    --corruption {corruption_type} \
+    --severity 5
 ```
 
-## Execution Instructions
+Supported corruptions: `motion_blur`, `defocus_blur`, `snow`, `fog`, `frost`, `brightness`, etc.
 
-### Source Pretraining
-
-- Download the source-trained [model weights](https://drive.google.com/file/d/1pjnmfRzz9zL_CuT-bXfR5W8J0KGw9Va4/view?usp=sharing) and and put them in AMROD/detectron2/tools/output/res50_fbn_1x and AMROD/detectron2/tools/output/res50_shift folder respectively
-
-The two models was pretrained respectively in the training set of Cityscapes and clear condition of SHIFT with a learning rate of 0.001. 
-
-### Adaptation
-
-- After training, load the source-trained weights and perform adaptation.
-There are four config file corresponding to the four adaptation tasks in the paper, i.e. cfg_cityscapes_c_short.yaml, cfg_cityscapes_c_long.yaml, cfg_shift_short.yaml, and cfg_ACDC_long.yaml.yaml.
-
-For examble, using
-```angular2
-cd AMROD/detectron2/tools
-CUDA_VISIBLE_DEVICES=$GPU_ID python adapt.py --config-file cfg_cityscapes_c_long.yaml
+### 3. Directory Structure
 ```
-for Cityscapes-to-Cityscapes-C long-term CTTA task.
+eta-object-detection/
+├── datasets/
+│   ├── cityscapes/
+│   │   ├── leftImg8bit/
+│   │   │   ├── train/
+│   │   │   └── val/
+│   │   └── annotations/
+│   │       ├── instancesonly_filtered_gtFine_train.json
+│   │       └── instancesonly_filtered_gtFine_val.json
+│   ├── motion_blur/
+│   │   └── leftImg8bit/val/
+│   ├── defocus_blur/
+│   │   └── leftImg8bit/val/
+│   └── snow/
+│       └── leftImg8bit/val/
+└── detectron2/
+    └── tools/output/res50_fbn_1x/
+        └── cityscapes_train_final.pth
+```
 
-## Acknowledgement
+### 4. Download Pretrained Weights
+Download the Cityscapes-trained Faster R-CNN weights from [this link](https://drive.google.com/file/d/1pjnmfRzz9zL_CuT-bXfR5W8J0KGw9Va4/view?usp=sharing) and place in:
+```
+detectron2/tools/output/res50_fbn_1x/cityscapes_train_final.pth
+```
+---
 
-We thank the developers and authors of [Detectron2](https://github.com/facebookresearch/detectron2) for releasing their helpful codebases.
+## Project Structure
+
+```
+eta-object-detection/
+├── preprocessing/
+│   ├── cityscapes_to_coco.py    # Convert Cityscapes → COCO format
+│   └── corrupt.py                # Apply corruptions to images
+├── test/
+│   ├── run_detectron.py          # Run baseline detection
+│   ├── run_energy_model_on_test_image.py  # Test energy model
+│   └── visualize_adaptation.py   # Visualize adaptation results
+├── train_energy_model.py         # Train ROI energy model
+├── adaptation.py                 # Run BN + energy adaptation
+└── models/                       # Saved energy models
+```
+
+---
+
+## Usage
+
+### 1. Training the Energy Model
+
+The energy model learns to predict detection quality by training on paired clean/corrupted images.
+
+**Edit Configuration:**
+```python
+# In train_energy_model.py, set:
+CORRUPTION = "motion_blur"  # or "defocus_blur", "snow", "fog", etc.
+CLEAN_DIR = "datasets/cityscapes/leftImg8bit/train"
+BLUR_DIR = f"datasets/{CORRUPTION}/leftImg8bit/train"
+```
+
+**Run Training:**
+```bash
+python train_energy_model.py
+```
+
+**Key Parameters:**
+- `num_epochs`: Training epochs (default: 2)
+- `learning_rate`: Adam LR (default: 5e-4)
+- `temperature`: Gibbs transform temperature for target energy
+  - Motion blur: 200
+  - Other corruptions: 200
+- `batch_accum`: Gradient accumulation steps (default: 32)
+
+**Output:**
+- Model checkpoint: `models/{corruption}_roi_energy_model_epoch{N}.pth`
+- TensorBoard logs: `runs/energy_model/`
+
+**Monitor Training:**
+```bash
+tensorboard --logdir=runs/energy_model
+```
+
+---
+
+### 2. Running Adaptation
+
+Perform test-time adaptation using the trained energy model.
+
+**Edit Configuration:**
+```python
+# In adaptation.py, set:
+CORRUPTION = "motion_blur"
+config = {
+    'image_dir': f'datasets/{CORRUPTION}/leftImg8bit/val',
+    'energy_model_path': f'models/{CORRUPTION}_roi_energy_model_epoch2.pth',
+    'adaptation_lr': 2.0,  # See tuning guide below
+    'iterations_per_image': 1,
+}
+```
+
+**Run Adaptation:**
+```bash
+python adaptation.py
+```
+
+**Output:**
+- Console: Per-image and global mAP metrics
+- TensorBoard logs: `runs/bn_energy_adaptation_{timestamp}/`
+
+**Monitor Results:**
+```bash
+tensorboard --logdir=runs/bn_energy_adaptation_{timestamp}
+```
+
+---
+
+### 3. Visualization
+
+Visualize detection results before and after adaptation:
+
+```bash
+python test/visualize_adaptation.py
+```
+
+This generates side-by-side comparison images showing:
+- Original corrupted image
+- Detections before adaptation
+- Detections after adaptation
+
+---
+
+## Acknowledgements
+
+This work builds upon several excellent open-source projects:
+
+- **[Detectron2](https://github.com/facebookresearch/detectron2)** - Facebook AI Research's object detection framework
+- **[AMROD](https://github.com/ShileiCao/AMROD)** - Adaptive Multi-Resolution Object Detection baseline
+- **[Cityscapes Dataset](https://www.cityscapes-dataset.com/)** - Urban street scene dataset
+
+## Contact
+
+For questions or issues, please open a GitHub issue or contact [your email].
